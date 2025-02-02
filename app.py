@@ -19,14 +19,9 @@ def create_or_update_yolo_yaml(
     dataset_base: Path,
     label_mapping: Dict[str, str],
     output_yaml_path: Path,
-    add_to_dataset: bool = True
 ):
     """
     Creates (or updates) a YOLO data.yaml file listing all train/val subfolders.
-    
-    If 'add_to_dataset=True' and output_yaml_path already exists, merges
-    new subfolders with any existing 'train'/'val' entries in that YAML.
-    Otherwise, overwrites them entirely.
     """
     # --- 1) Gather subfolders in train/val (and optionally test) ---
     train_dir = dataset_base / "images" / "train"
@@ -56,39 +51,29 @@ def create_or_update_yolo_yaml(
     data["nc"] = len(label_mapping)
     data["names"] = list(label_mapping.keys())  
 
-    # Prepare the new train/val/test lists
-    if add_to_dataset:
-        # Merge with existing if present
-        old_train = data.get("train", [])
-        old_val   = data.get("val", [])
-        old_test  = data.get("test", [])
+    # Prepare the new train/val/test lists and merge with existing if present
+    old_train = data.get("train", [])
+    old_val   = data.get("val", [])
+    old_test  = data.get("test", [])
 
-        # Handle existing YAML entries that might be a single string or list:
-        if isinstance(old_train, str):
-            old_train = [old_train]
-        if isinstance(old_val, str):
-            old_val = [old_val]
-        if isinstance(old_test, str):
-            old_test = [old_test]
+    # Handle existing YAML entries that might be a single string or list:
+    if isinstance(old_train, str):
+        old_train = [old_train]
+    if isinstance(old_val, str):
+        old_val = [old_val]
+    if isinstance(old_test, str):
+        old_test = [old_test]
 
-        # Combine old + new, ensure uniqueness
-        data["train"] = sorted(set(old_train + train_subfolders))
-        data["val"]   = sorted(set(old_val + val_subfolders))
-        if test_subfolders:
-            data["test"] = sorted(set(old_test + test_subfolders))
-        elif "test" in data:
-            # If you prefer removing 'test' if there's no test folders
-            del data["test"]
-    else:
-        # Overwrite entirely
-        data["train"] = train_subfolders
-        data["val"]   = val_subfolders
-        if test_subfolders:
-            data["test"] = test_subfolders
-        else:
-            data.pop("test", None)
+    # Combine old + new, ensure uniqueness
+    data["train"] = sorted(set(old_train + train_subfolders))
+    data["val"]   = sorted(set(old_val + val_subfolders))
+    if test_subfolders:
+        data["test"] = sorted(set(old_test + test_subfolders))
+    elif "test" in data:
+        # If you prefer removing 'test' if there's no test folders
+        del data["test"]
 
-    # --- 3) Write the final data back to YAML in bracketed style ---
+    # Write the final data back to YAML in bracketed style
     with open(output_yaml_path, "w") as f:
         # Write `train:` in bracketed multi-line style
         if "train" in data and data["train"]:
@@ -122,10 +107,8 @@ class DatasetConfig:
     """Configuration for dataset processing"""
     input_path: Path
     dataset_base: Path
-    output_base: Optional[Path] = None
     val_split_ratio: float = 0.2
     test_split_ratio: float = 0.0
-    add_to_dataset: bool = True
     label_mapping: Dict[str, str] = None
     random_seed: int = 42
     rename_files: bool = True
@@ -134,8 +117,6 @@ class DatasetConfig:
     def __post_init__(self):
         self.input_path = Path(self.input_path)
         self.dataset_base = Path(self.dataset_base)
-        if self.output_base is not None:
-            self.output_base = Path(self.output_base)
         
         if self.dataset_name is None:
             self.dataset_name = self.input_path.name
@@ -164,44 +145,32 @@ class COCOtoYOLOConverter:
 
     def find_cvat_coco_folders(self, parent_dir: Path) -> List[Path]:
         """
-        Return a list of valid CVAT COCO folders at either:
-        1) The parent_dir itself (if it has 'images' and 'annotations' + JSON)
-        2) Any immediate subfolders that do the same
-
-        No deeper levels are considered.
+        Walk through the entire directory tree rooted at parent_dir and return a list
+        of valid CVAT COCO folders. A folder is considered valid if self.is_cvat_coco_folder
+        returns True.
         """
-        cvat_folders = []
+        cvat_folders = set()
 
-        # 1) If parent_dir is itself a valid CVAT COCO folder, add it
-        if self.is_cvat_coco_folder(parent_dir):
-            cvat_folders.append(parent_dir)
+        # os.walk will yield the parent_dir as the first iteration, then all subdirectories
+        for dirpath, _dirnames, _filenames in os.walk(parent_dir):
+            path = Path(dirpath)
+            if self.is_cvat_coco_folder(path):
+                cvat_folders.add(path)
 
-        # 2) Check all immediate child directories
-        for item in parent_dir.iterdir():
-            if item.is_dir() and self.is_cvat_coco_folder(item):
-                cvat_folders.append(item)
-
-        # Return unique folders in sorted order
-        return sorted(set(cvat_folders))
+        # Return the unique folders in sorted order
+        return sorted(cvat_folders)
 
 
     def setup_directories(self) -> None:
         """Create necessary directories based on configuration"""
         dataset_name = self.config.dataset_name
-        
-        if self.config.output_base is not None:
-            # If output_base is provided, create separate output directories
-            self.label_output_dir = self.config.output_base / "labels"
-            self.image_output_dir = self.config.output_base / "images"
-            self.label_output_dir.mkdir(parents=True, exist_ok=True)
-            self.image_output_dir.mkdir(parents=True, exist_ok=True)
-        else:
-            # Use a 'temp' location inside dataset_base so we don't pollute 'train' by default.
-            temp_dir = self.config.dataset_base / "__temp__" / dataset_name
-            self.label_output_dir = temp_dir / "labels"
-            self.image_output_dir = temp_dir / "images"
-            self.label_output_dir.mkdir(parents=True, exist_ok=True)
-            self.image_output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Always use a temporary folder inside dataset_base
+        temp_dir = self.config.dataset_base / "__temp__" / dataset_name
+        self.label_output_dir = temp_dir / "labels"
+        self.image_output_dir = temp_dir / "images"
+        self.label_output_dir.mkdir(parents=True, exist_ok=True)
+        self.image_output_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def coco_to_yolo_polygon(coco_polygon: List[float], img_width: int, img_height: int) -> List[Tuple[float, float]]:
@@ -337,13 +306,9 @@ class COCOtoYOLOConverter:
 
     def split_and_organize_dataset(self) -> None:
         """Split dataset into train, val (and optional test) sets and organize files."""
-        if not self.config.add_to_dataset:
-            self.log("Skipping dataset organization (add_to_dataset=False)")
-            return
-
         try:
             dataset_name = self.config.dataset_name
-            # We'll gather final subset destinations here:
+            # Final destination directories:
             train_image_dir = self.config.dataset_base / 'images' / 'train' / dataset_name
             val_image_dir   = self.config.dataset_base / 'images' / 'val' / dataset_name
             train_label_dir = self.config.dataset_base / 'labels' / 'train' / dataset_name
@@ -355,7 +320,7 @@ class COCOtoYOLOConverter:
                 test_image_dir = self.config.dataset_base / 'images' / 'test' / dataset_name
                 test_label_dir = self.config.dataset_base / 'labels' / 'test' / dataset_name
 
-            # Collect all files from the temporary image_output_dir / label_output_dir
+            # Collect files from the temporary directories
             image_files = sorted(os.listdir(self.image_output_dir))
             label_files = sorted(os.listdir(self.label_output_dir))
             
@@ -480,7 +445,6 @@ class COCOtoYOLOConverter:
                 dataset_base=self.config.dataset_base,
                 label_mapping=self.config.label_mapping,
                 output_yaml_path=output_yaml_path,
-                add_to_dataset=True  # or False to overwrite
             )
             self.log(f"YOLO data.yaml updated/created at {output_yaml_path}")
 
@@ -509,10 +473,8 @@ class COCOtoYOLOConverter:
                 folder_config = DatasetConfig(
                     input_path=folder,
                     dataset_base=self.config.dataset_base,
-                    output_base=self.config.output_base,
                     val_split_ratio=self.config.val_split_ratio,
                     test_split_ratio=self.config.test_split_ratio,
-                    add_to_dataset=self.config.add_to_dataset,
                     label_mapping=self.config.label_mapping,
                     random_seed=self.config.random_seed,
                     rename_files=self.config.rename_files,
@@ -536,7 +498,8 @@ class COCOtoYOLOConverter:
         # Validate input paths
         if not images_folder.exists():
             raise FileNotFoundError(f"Images directory not found: {images_folder}")
-        
+
+        # Create temporary output directories for images/labels
         self.setup_directories()
 
         # Check for images before proceeding
@@ -575,27 +538,56 @@ class COCOtoYOLOConverter:
             if not os.path.exists(self.label_output_dir) or not os.listdir(self.label_output_dir):
                 raise ValueError("No labels were generated successfully")
                 
-            # Split / organize
+            # 3) Split / organize
             self.split_and_organize_dataset()
             
         except Exception as e:
             self.log(f"Error during processing: {str(e)}")
             raise
         finally:
-            # Clean up the temporary directory if we did not use an explicit output_base
-            if config.output_base is None:
-                temp_dir = config.dataset_base / "__temp__" / config.dataset_name
-                if temp_dir.exists():
-                    self.log(f"Cleaning up temporary folder: {temp_dir}")
-                    shutil.rmtree(temp_dir, ignore_errors=True)
-                
-                # If __temp__ is now empty, remove it
-                parent_temp = config.dataset_base / "__temp__"
-                if parent_temp.exists():
-                    try:
-                        parent_temp.rmdir()  # Will only succeed if empty
-                    except OSError:
-                        pass  # It's not empty, so just leave it
+            # Clean up the temporary directory
+            temp_dir = config.dataset_base / "__temp__" / config.dataset_name
+            if temp_dir.exists():
+                self.log(f"Cleaning up temporary folder: {temp_dir}")
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            
+            # If __temp__ is now empty, remove it
+            parent_temp = config.dataset_base / "__temp__"
+            if parent_temp.exists():
+                try:
+                    parent_temp.rmdir()  # Will only succeed if empty
+                except OSError:
+                    pass
+
+    def check_target_folders_exist(self, config: DatasetConfig) -> None:
+        """
+        Construct the final train/val(/test) subfolder paths for this dataset
+        and raise an error if any already exist.
+        """
+        dataset_name = config.dataset_name
+        train_image_dir = config.dataset_base / 'images' / 'train' / dataset_name
+        val_image_dir   = config.dataset_base / 'images' / 'val' / dataset_name
+        train_label_dir = config.dataset_base / 'labels' / 'train' / dataset_name
+        val_label_dir   = config.dataset_base / 'labels' / 'val' / dataset_name
+
+        dirs_to_check = [train_image_dir, val_image_dir, train_label_dir, val_label_dir]
+
+        if config.test_split_ratio > 0:
+            test_image_dir = config.dataset_base / 'images' / 'test' / dataset_name
+            test_label_dir = config.dataset_base / 'labels' / 'test' / dataset_name
+            dirs_to_check.append(test_image_dir)
+            dirs_to_check.append(test_label_dir)
+
+        # Identify any folders that exist
+        already_existing = [str(d) for d in dirs_to_check if d.exists()]
+        if already_existing:
+            msg = (
+                "Refusing to proceed because the following target folder(s) "
+                "already exist for this dataset:\n"
+                + "\n".join(f" - {p}" for p in already_existing)
+            )
+            raise FileExistsError(msg)
+
 
 class ConversionWorker(QThread):
     progress = pyqtSignal(str)
@@ -667,7 +659,7 @@ class MainWindow(QMainWindow):
         # Left side container for all groups except mapping
         left_container = QVBoxLayout()
 
-        # --- Path configuration group ---
+        # Path configuration group
         path_group = QGroupBox("Path Configuration")
         path_layout = QVBoxLayout()
 
@@ -675,7 +667,7 @@ class MainWindow(QMainWindow):
         input_layout = QHBoxLayout()
         self.input_path = QLineEdit()
         self.input_path.setPlaceholderText(
-            "Select a CVAT COCO folder or parent folder containing multiple CVAT COCO folders"
+            "Select COCO folder or parent containing COCO folders"
         )
         self.input_path.textChanged.connect(self.input_path_changed)
         self.input_path.textChanged.connect(self.update_convert_button_state)
@@ -686,26 +678,7 @@ class MainWindow(QMainWindow):
         input_layout.addWidget(input_button)
         path_layout.addLayout(input_layout)
 
-        # Output base path with checkbox to the side
-        output_layout = QHBoxLayout()
-        output_path_layout = QHBoxLayout()
-        output_path_layout.addWidget(QLabel("Output Base:"))
-        self.output_base = QLineEdit()
-        self.output_base.textChanged.connect(self.update_convert_button_state)
-        self.output_base.setEnabled(False)  # Initially disabled
-        output_path_layout.addWidget(self.output_base)
-        self.output_browse_button = QPushButton("Browse...")
-        self.output_browse_button.clicked.connect(lambda: self.browse_folder(self.output_base))
-        self.output_browse_button.setEnabled(False)  # Initially disabled
-        output_path_layout.addWidget(self.output_browse_button)
-        self.use_output_base = QCheckBox()
-        self.use_output_base.stateChanged.connect(self.update_convert_button_state)
-        self.use_output_base.stateChanged.connect(self.toggle_output_base)
-        output_path_layout.addWidget(self.use_output_base)
-        output_layout.addLayout(output_path_layout)
-        path_layout.addLayout(output_layout)
-
-        # Dataset base path + "Add to dataset" checkbox
+        # Dataset base path
         dataset_layout = QHBoxLayout()
         self.dataset_base = QLineEdit()
         self.dataset_base.textChanged.connect(self.update_convert_button_state)
@@ -716,18 +689,11 @@ class MainWindow(QMainWindow):
         dataset_layout.addWidget(self.dataset_base)
         dataset_layout.addWidget(self.dataset_button)
 
-        # Checkbox for "Add to Dataset" next to dataset base
-        self.add_to_dataset = QCheckBox()
-        self.add_to_dataset.setChecked(True)
-        self.use_output_base.stateChanged.connect(self.toggle_dataset_base)
-        self.add_to_dataset.stateChanged.connect(self.update_convert_button_state)
-        dataset_layout.addWidget(self.add_to_dataset)
-
         path_layout.addLayout(dataset_layout)
         path_group.setLayout(path_layout)
         left_container.addWidget(path_group)
 
-        # --- Configuration group (Split ratios, Random Seed) ---
+        # Configuration group (Split ratios, Random Seed)
         config_group = QGroupBox("Configuration")
         config_layout = QVBoxLayout()
 
@@ -816,26 +782,9 @@ class MainWindow(QMainWindow):
                     process_cvat_folder(item)
 
     def update_convert_button_state(self):
-        # Basic flags
         have_input_path = bool(self.input_path.text().strip())
         have_dataset_base = bool(self.dataset_base.text().strip())
-        
-        # Only consider output_base if the checkbox is checked
-        want_output_base = self.use_output_base.isChecked()
-        have_output_base = bool(self.output_base.text().strip()) if want_output_base else False
-        
-        add_to_dataset_checked = self.add_to_dataset.isChecked()
-        
-        # If no dataset base AND no output base, we can't proceed
-        if not have_dataset_base and not have_output_base:
-            can_convert = False
-        # If we have dataset_base but do not have output_base, and not adding to dataset => can't proceed
-        elif have_dataset_base and not have_output_base and not add_to_dataset_checked:
-            can_convert = False
-        else:
-            # Otherwise we have a valid place to save and an input path
-            can_convert = have_input_path
-
+        can_convert = have_input_path and have_dataset_base
         self.convert_button.setEnabled(can_convert)
 
     def load_categories_from_file(self, json_path):
@@ -888,9 +837,6 @@ class MainWindow(QMainWindow):
             if not self.input_path.text() or not self.dataset_base.text():
                 raise ValueError("Input path and dataset base must be specified")
 
-            # Output base is optional
-            output_base = self.output_base.text() if self.use_output_base.isChecked() else None
-
             label_mapping = self.mapping_table.get_mapping()
             if not label_mapping:
                 raise ValueError("Label mapping cannot be empty")
@@ -898,10 +844,8 @@ class MainWindow(QMainWindow):
             config = DatasetConfig(
                 input_path=self.input_path.text(),
                 dataset_base=self.dataset_base.text(),
-                output_base=output_base,
                 val_split_ratio=self.val_split.value(),
                 test_split_ratio=self.test_split.value(),
-                add_to_dataset=self.add_to_dataset.isChecked(),
                 label_mapping=label_mapping,
                 random_seed=self.random_seed.value()
             )
@@ -920,20 +864,10 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.show_error(str(e))
 
-    def toggle_output_base(self, state):
-        """Enable/disable output base widgets based on checkbox state"""
-        enabled = bool(state)  # Convert Qt.CheckState to boolean
-        self.output_base.setEnabled(enabled)
-        self.output_browse_button.setEnabled(enabled)
-        if not enabled:
-            self.output_base.clear()  # Clear the text when disabled
-    
-    def toggle_dataset_base(self, state):
-        """
-        Enable/disable dataset_base if user unchecks "Add to Dataset".
-        Adjust as needed for your UI logic. Currently leaving as-is.
-        """
-        pass
+    def browse_folder(self, line_edit):
+        folder = QFileDialog.getExistingDirectory(self, "Select Directory")
+        if folder:
+            line_edit.setText(folder)
 
 def main():
     app = QApplication(sys.argv)
