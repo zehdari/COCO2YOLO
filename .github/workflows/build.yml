@@ -40,7 +40,7 @@ jobs:
           libxkbcommon0 \
           libxcb-render0 \
           libxrender1 \
-          libgl1-mesa-glx \
+          libgl1 \
           build-essential \
           qtbase5-dev \
           qtchooser \
