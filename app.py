@@ -17,6 +17,17 @@ import yaml
 from typing import Dict, Optional, List, Tuple, Set
 from sklearn.model_selection import train_test_split
 
+def resource_path(relative_path):
+    """Get absolute path to resource, works for dev and for PyInstaller."""
+    try:
+        # If the app is run as a bundled executable, _MEIPASS will exist.
+        base_path = Path(sys._MEIPASS)
+    except AttributeError:
+        # Otherwise, use the current working directory (or adjust as needed)
+        base_path = Path(os.path.abspath("."))
+    return base_path / relative_path
+
+
 def create_or_update_yolo_yaml(
     dataset_base: Path,
     label_mapping: Dict[str, str],
@@ -756,7 +767,7 @@ class MainWindow(QMainWindow):
         tab_widget.addTab(help_tab, "Help")
 
         # Load markdown text from a file (e.g., help.md)
-        help_file = Path("Resources/help.md")  # Adjust the path as needed
+        help_file = resource_path("Resources/help.md")
         if help_file.exists():
             try:
                 with open(help_file, "r", encoding="utf-8") as f:
