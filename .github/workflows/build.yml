@@ -114,16 +114,15 @@ jobs:
     # Upload artifacts for macOS (only the zip file)
     - name: Upload macOS zip
       if: matrix.os == 'macos-latest'
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: COCO2YOLO-macos
         path: dist/COCO2YOLO-macOS.zip
 
-
     # Upload artifacts for other platforms (Windows, Ubuntu, Red Hat)
     - name: Upload executables
       if: matrix.os != 'macos-latest'
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: COCO2YOLO-${{ matrix.os }}
         path: dist/*
