@@ -89,19 +89,20 @@ jobs:
     - name: Build with PyInstaller for Windows
       if: matrix.os == 'windows-latest'
       run: |
-        pyinstaller --onefile --windowed --name=COCO2YOLO app.py
+        pyinstaller --onefile --windowed --name=COCO2YOLO app.py --add-data "Resources/;Resources"
 
     # Build with PyInstaller for macOS
     - name: Build with PyInstaller for macOS
       if: matrix.os == 'macos-latest'
       run: |
-        pyinstaller --onefile --windowed --name=COCO2YOLO app.py
+        pyinstaller --onefile --windowed --name=COCO2YOLO app.py --add-data "Resources/:Resources"
 
     # Build with PyInstaller for Ubuntu
     - name: Build with PyInstaller for Ubuntu
       if: matrix.os == 'ubuntu-latest'
       run: |
-        pyinstaller --onefile --windowed --name=COCO2YOLO app.py
+        pyinstaller --onefile --windowed --name=COCO2YOLO app.py --add-data "Resources/:Resources"
+
 
     # macOS-specific step to set executable permissions and zip the .app bundle
     - name: Set permissions and zip .app for macOS

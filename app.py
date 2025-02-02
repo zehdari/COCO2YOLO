@@ -3,14 +3,16 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QFileDialog, QSpinBox,
-    QDoubleSpinBox, QCheckBox, QTextEdit, QGroupBox, QMessageBox,
-    QTableWidget, QTableWidgetItem, QHeaderView
+    QDoubleSpinBox, QTextEdit, QGroupBox, QMessageBox,
+    QTableWidget, QTableWidgetItem, QHeaderView, QTextBrowser, 
+    QTabWidget
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 import json
 from dataclasses import dataclass
 import shutil
 import os
+import markdown
 import yaml
 from typing import Dict, Optional, List, Tuple, Set
 from sklearn.model_selection import train_test_split
@@ -223,7 +225,6 @@ class COCOtoYOLOConverter:
                                 " ".join(f"{x} {y}" for x, y in yolo_polygon)
                             )
                             f_lbl.write(line + '\n')
-                self.log(f"Processed annotations for {output_filename}")
         except Exception as e:
             self.log(f"Error processing annotations: {str(e)}")
             raise
@@ -302,7 +303,6 @@ class COCOtoYOLOConverter:
                 
             new_path = self.image_output_dir / new_filename
             shutil.copy2(file_path, new_path)
-            self.log(f"Copied {file_path.name} to {new_filename}")
 
     def split_and_organize_dataset(self) -> None:
         """Split dataset into train, val (and optional test) sets and organize files."""
@@ -548,7 +548,6 @@ class COCOtoYOLOConverter:
             # Clean up the temporary directory
             temp_dir = config.dataset_base / "__temp__" / config.dataset_name
             if temp_dir.exists():
-                self.log(f"Cleaning up temporary folder: {temp_dir}")
                 shutil.rmtree(temp_dir, ignore_errors=True)
             
             # If __temp__ is now empty, remove it
@@ -652,17 +651,20 @@ class MainWindow(QMainWindow):
         self.setupUI()
         
     def setupUI(self):
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QHBoxLayout(central_widget)
-
-        # Left side container for all groups except mapping
+        # Create a QTabWidget to hold multiple tabs (Conversion and Help)
+        tab_widget = QTabWidget()
+        self.setCentralWidget(tab_widget)
+        
+        # ----- Conversion Tab -----
+        conversion_tab = QWidget()
+        conversion_layout = QHBoxLayout(conversion_tab)
+        
+        # Left side container for groups (Path Config, Configuration, Log, Convert Button)
         left_container = QVBoxLayout()
-
+        
         # Path configuration group
         path_group = QGroupBox("Path Configuration")
         path_layout = QVBoxLayout()
-
         # Input path
         input_layout = QHBoxLayout()
         self.input_path = QLineEdit()
@@ -677,26 +679,22 @@ class MainWindow(QMainWindow):
         input_layout.addWidget(self.input_path)
         input_layout.addWidget(input_button)
         path_layout.addLayout(input_layout)
-
         # Dataset base path
         dataset_layout = QHBoxLayout()
         self.dataset_base = QLineEdit()
         self.dataset_base.textChanged.connect(self.update_convert_button_state)
         self.dataset_button = QPushButton("Browse...")
         self.dataset_button.clicked.connect(lambda: self.browse_folder(self.dataset_base))
-        dataset_button_label = QLabel("Dataset Base:")
-        dataset_layout.addWidget(dataset_button_label)
+        dataset_layout.addWidget(QLabel("Dataset Base:"))
         dataset_layout.addWidget(self.dataset_base)
         dataset_layout.addWidget(self.dataset_button)
-
         path_layout.addLayout(dataset_layout)
         path_group.setLayout(path_layout)
         left_container.addWidget(path_group)
-
+        
         # Configuration group (Split ratios, Random Seed)
         config_group = QGroupBox("Configuration")
         config_layout = QVBoxLayout()
-
         # Validation split ratio
         val_layout = QHBoxLayout()
         self.val_split = QDoubleSpinBox()
@@ -706,7 +704,6 @@ class MainWindow(QMainWindow):
         val_layout.addWidget(QLabel("Validation Split Ratio:"))
         val_layout.addWidget(self.val_split)
         config_layout.addLayout(val_layout)
-
         # Test split ratio
         test_layout = QHBoxLayout()
         self.test_split = QDoubleSpinBox()
@@ -716,7 +713,6 @@ class MainWindow(QMainWindow):
         test_layout.addWidget(QLabel("Test Split Ratio:"))
         test_layout.addWidget(self.test_split)
         config_layout.addLayout(test_layout)
-
         # Random seed
         seed_layout = QHBoxLayout()
         self.random_seed = QSpinBox()
@@ -725,31 +721,58 @@ class MainWindow(QMainWindow):
         seed_layout.addWidget(QLabel("Random Seed:"))
         seed_layout.addWidget(self.random_seed)
         config_layout.addLayout(seed_layout)
-
         config_group.setLayout(config_layout)
         left_container.addWidget(config_group)
-
+        
         # Log output
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
         left_container.addWidget(self.log_output)
-
+        
         # Convert button
         self.convert_button = QPushButton("Convert")
         self.convert_button.setEnabled(False)
         self.convert_button.clicked.connect(self.start_conversion)
         left_container.addWidget(self.convert_button)
-
-        # Right side - Label Mapping
+        
+        conversion_layout.addLayout(left_container, stretch=60)
+        
+        # Right side - Label Mapping (unchanged)
         mapping_group = QGroupBox("Label Mapping")
         mapping_layout = QVBoxLayout()
         self.mapping_table = LabelMappingTable()
         mapping_layout.addWidget(self.mapping_table)
         mapping_group.setLayout(mapping_layout)
+        conversion_layout.addWidget(mapping_group, stretch=40)
+        
+        # Add the Conversion tab to the tab widget
+        tab_widget.addTab(conversion_tab, "Conversion")
+        
+        # ----- Help Tab (Markdown Viewer) -----
+        help_tab = QWidget()
+        help_layout = QVBoxLayout(help_tab)
+        self.markdown_viewer = QTextBrowser()
+        help_layout.addWidget(self.markdown_viewer)
+        tab_widget.addTab(help_tab, "Help")
 
-        # Add both containers to main layout
-        main_layout.addLayout(left_container, stretch=60)
-        main_layout.addWidget(mapping_group, stretch=40)
+        # Load markdown text from a file (e.g., help.md)
+        help_file = Path("Resources/help.md")  # Adjust the path as needed
+        if help_file.exists():
+            try:
+                with open(help_file, "r", encoding="utf-8") as f:
+                    markdown_text = f.read()
+            except Exception as e:
+                markdown_text = f"# Error Loading Help File\n\n{str(e)}"
+        else:
+            markdown_text = "# Help File Not Found\n\nPlease ensure 'help.md' exists in the correct location."
+
+        # Convert markdown to HTML and set the content of the viewer
+        try:
+            html = markdown.markdown(markdown_text)
+            self.markdown_viewer.setHtml(html)
+        except Exception as e:
+            # Fallback: display plain text if conversion fails
+            self.markdown_viewer.setPlainText(markdown_text)
 
     def input_path_changed(self, new_path):
         """Handle input path changes and try to load JSON automatically"""
