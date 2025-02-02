@@ -1,0 +1,945 @@
+import sys
+from pathlib import Path
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QLineEdit, QFileDialog, QSpinBox,
+    QDoubleSpinBox, QCheckBox, QTextEdit, QGroupBox, QMessageBox,
+    QTableWidget, QTableWidgetItem, QHeaderView
+)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+import json
+from dataclasses import dataclass
+import shutil
+import os
+import yaml
+from typing import Dict, Optional, List, Tuple, Set
+from sklearn.model_selection import train_test_split
+
+def create_or_update_yolo_yaml(
+    dataset_base: Path,
+    label_mapping: Dict[str, str],
+    output_yaml_path: Path,
+    add_to_dataset: bool = True
+):
+    """
+    Creates (or updates) a YOLO data.yaml file listing all train/val subfolders.
+    
+    If 'add_to_dataset=True' and output_yaml_path already exists, merges
+    new subfolders with any existing 'train'/'val' entries in that YAML.
+    Otherwise, overwrites them entirely.
+    """
+    # --- 1) Gather subfolders in train/val (and optionally test) ---
+    train_dir = dataset_base / "images" / "train"
+    val_dir   = dataset_base / "images" / "val"
+    test_dir  = dataset_base / "images" / "test"  # if you want to include test
+
+    def list_subfolders(dir_path: Path) -> List[str]:
+        """Return list of subfolder paths (as strings) for a given directory."""
+        subfolders = []
+        if dir_path.is_dir():
+            for item in sorted(dir_path.iterdir()):
+                if item.is_dir():
+                    subfolders.append(str(item.resolve()))
+        return subfolders
+
+    train_subfolders = list_subfolders(train_dir)
+    val_subfolders   = list_subfolders(val_dir)
+    test_subfolders  = list_subfolders(test_dir)  # only if needed
+
+    # --- 2) Load existing YAML (if any) and decide how to handle merges/overwrites ---
+    data = {}
+    if output_yaml_path.exists():
+        with open(output_yaml_path, "r") as f:
+            data = yaml.safe_load(f) or {}
+
+    # Always store nc and names fresh:
+    data["nc"] = len(label_mapping)
+    data["names"] = list(label_mapping.keys())  
+
+    # Prepare the new train/val/test lists
+    if add_to_dataset:
+        # Merge with existing if present
+        old_train = data.get("train", [])
+        old_val   = data.get("val", [])
+        old_test  = data.get("test", [])
+
+        # Handle existing YAML entries that might be a single string or list:
+        if isinstance(old_train, str):
+            old_train = [old_train]
+        if isinstance(old_val, str):
+            old_val = [old_val]
+        if isinstance(old_test, str):
+            old_test = [old_test]
+
+        # Combine old + new, ensure uniqueness
+        data["train"] = sorted(set(old_train + train_subfolders))
+        data["val"]   = sorted(set(old_val + val_subfolders))
+        if test_subfolders:
+            data["test"] = sorted(set(old_test + test_subfolders))
+        elif "test" in data:
+            # If you prefer removing 'test' if there's no test folders
+            del data["test"]
+    else:
+        # Overwrite entirely
+        data["train"] = train_subfolders
+        data["val"]   = val_subfolders
+        if test_subfolders:
+            data["test"] = test_subfolders
+        else:
+            data.pop("test", None)
+
+    # --- 3) Write the final data back to YAML in bracketed style ---
+    with open(output_yaml_path, "w") as f:
+        # Write `train:` in bracketed multi-line style
+        if "train" in data and data["train"]:
+            train_str = ",\n  ".join(data["train"])
+            f.write(f"train: [\n  {train_str}\n]\n")
+        else:
+            f.write("train: []\n")
+
+        # Write `val:` in bracketed multi-line style
+        if "val" in data and data["val"]:
+            val_str = ",\n  ".join(data["val"])
+            f.write(f"val: [\n  {val_str}\n]\n")
+        else:
+            f.write("val: []\n")
+
+        # (Optional) `test:` in bracketed multi-line style
+        if "test" in data and data["test"]:
+            test_str = ",\n  ".join(data["test"])
+            f.write(f"test: [\n  {test_str}\n]\n")
+
+        # Number of classes
+        f.write(f"nc: {data['nc']}\n")
+
+        # names: bracketed, with single quotes around each category name
+        quoted_names = ", ".join(f"'{name}'" for name in data["names"])
+        f.write(f"names: [{quoted_names}]\n")
+
+
+@dataclass
+class DatasetConfig:
+    """Configuration for dataset processing"""
+    input_path: Path
+    dataset_base: Path
+    output_base: Optional[Path] = None
+    val_split_ratio: float = 0.2
+    test_split_ratio: float = 0.0
+    add_to_dataset: bool = True
+    label_mapping: Dict[str, str] = None
+    random_seed: int = 42
+    rename_files: bool = True
+    dataset_name: Optional[str] = None
+
+    def __post_init__(self):
+        self.input_path = Path(self.input_path)
+        self.dataset_base = Path(self.dataset_base)
+        if self.output_base is not None:
+            self.output_base = Path(self.output_base)
+        
+        if self.dataset_name is None:
+            self.dataset_name = self.input_path.name
+        
+        if self.label_mapping is None:
+            raise ValueError("label_mapping must be provided - cannot be None")
+
+class COCOtoYOLOConverter:
+    """Handles conversion of COCO format annotations to YOLO format"""
+    
+    def __init__(self, config: DatasetConfig, progress_signal):
+        self.config = config
+        self.progress_signal = progress_signal
+        self.file_mapping = {}
+
+    def is_cvat_coco_folder(self, folder: Path) -> bool:
+        """Check if a folder has the CVAT COCO structure"""
+        images_dir = folder / 'images'
+        annotations_dir = folder / 'annotations'
+        return (
+            folder.is_dir() and 
+            images_dir.exists() and 
+            annotations_dir.exists() and 
+            any(annotations_dir.glob('*.json'))
+        )
+
+    def find_cvat_coco_folders(self, parent_dir: Path) -> List[Path]:
+        """
+        Return a list of valid CVAT COCO folders at either:
+        1) The parent_dir itself (if it has 'images' and 'annotations' + JSON)
+        2) Any immediate subfolders that do the same
+
+        No deeper levels are considered.
+        """
+        cvat_folders = []
+
+        # 1) If parent_dir is itself a valid CVAT COCO folder, add it
+        if self.is_cvat_coco_folder(parent_dir):
+            cvat_folders.append(parent_dir)
+
+        # 2) Check all immediate child directories
+        for item in parent_dir.iterdir():
+            if item.is_dir() and self.is_cvat_coco_folder(item):
+                cvat_folders.append(item)
+
+        # Return unique folders in sorted order
+        return sorted(set(cvat_folders))
+
+
+    def setup_directories(self) -> None:
+        """Create necessary directories based on configuration"""
+        dataset_name = self.config.dataset_name
+        
+        if self.config.output_base is not None:
+            # If output_base is provided, create separate output directories
+            self.label_output_dir = self.config.output_base / "labels"
+            self.image_output_dir = self.config.output_base / "images"
+            self.label_output_dir.mkdir(parents=True, exist_ok=True)
+            self.image_output_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            # Use a 'temp' location inside dataset_base so we don't pollute 'train' by default.
+            temp_dir = self.config.dataset_base / "__temp__" / dataset_name
+            self.label_output_dir = temp_dir / "labels"
+            self.image_output_dir = temp_dir / "images"
+            self.label_output_dir.mkdir(parents=True, exist_ok=True)
+            self.image_output_dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def coco_to_yolo_polygon(coco_polygon: List[float], img_width: int, img_height: int) -> List[Tuple[float, float]]:
+        """Convert COCO polygon coordinates to YOLO format"""
+        return [
+            (coco_polygon[i] / img_width, coco_polygon[i+1] / img_height) 
+            for i in range(0, len(coco_polygon), 2)
+        ]
+
+    def log(self, message: str) -> None:
+        """Emit a log message through the progress signal"""
+        self.progress_signal.emit(message)
+
+    def convert_annotations(self, json_file_path: Path) -> None:
+        """Convert COCO JSON annotations to YOLO format"""
+        try:
+            with open(json_file_path) as f:
+                data = json.load(f)
+
+            category_mapping = {cat['id']: cat['name'] for cat in data['categories']}
+            
+            for index, image in enumerate(data['images']):
+                image_id = image['id']
+                img_width, img_height = image['width'], image['height']
+                annotations = [ann for ann in data['annotations'] if ann['image_id'] == image_id]
+                
+                output_filename = (
+                    f'{index}.txt' if self.config.rename_files 
+                    else Path(image['file_name']).with_suffix('.txt').name
+                )
+                
+                # Map original image name to the new one
+                new_image_name = (
+                    f"{index}{Path(image['file_name']).suffix}"
+                    if self.config.rename_files
+                    else image['file_name']
+                )
+                self.file_mapping[image['file_name']] = new_image_name
+                
+                output_file = self.label_output_dir / output_filename
+                with open(output_file, 'w') as f_lbl:
+                    for ann in annotations:
+                        category_id = ann['category_id']
+                        for coco_polygon in ann['segmentation']:
+                            yolo_polygon = self.coco_to_yolo_polygon(
+                                coco_polygon, img_width, img_height
+                            )
+                            line = (
+                                f"{self.config.label_mapping[category_mapping[category_id]]} " +
+                                " ".join(f"{x} {y}" for x, y in yolo_polygon)
+                            )
+                            f_lbl.write(line + '\n')
+                self.log(f"Processed annotations for {output_filename}")
+        except Exception as e:
+            self.log(f"Error processing annotations: {str(e)}")
+            raise
+
+    def check_missing_mappings(self, json_file_path: Path) -> Set[str]:
+        """Scan actual annotations and identify categories missing from label_mapping"""
+        try:
+            with open(json_file_path) as f:
+                data = json.load(f)
+                
+            category_mapping = {cat['id']: cat['name'] for cat in data['categories']}
+            used_category_ids = {ann['category_id'] for ann in data['annotations']}
+            used_categories = {category_mapping[cat_id] for cat_id in used_category_ids}
+            missing_categories = used_categories - set(self.config.label_mapping.keys())
+            
+            if missing_categories:
+                self.log("\nWARNING: Found categories in annotations without label mappings:")
+                for cat in sorted(missing_categories):
+                    self.log(f"  - {cat}")
+                self.log("\nPlease add these categories to your label_mapping dictionary.")
+                
+                self.log("\nCategory usage statistics:")
+                for cat_id in used_category_ids:
+                    cat_name = category_mapping[cat_id]
+                    count = sum(1 for ann in data['annotations'] if ann['category_id'] == cat_id)
+                    self.log(f"  - {cat_name}: {count} instances")
+                
+            return missing_categories
+                
+        except Exception as e:
+            self.log(f"Error checking label mappings: {str(e)}")
+            raise
+    
+    def find_images(self, folder: Path) -> List[Path]:
+        """Find all image files in a folder"""
+        patterns = ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']
+        images = []
+        for pattern in patterns:
+            images.extend(list(folder.glob(pattern)))
+        return sorted(images)
+
+    def process_empty_annotations(self, images_folder: Path) -> None:
+        """Create empty annotation files for images without annotations"""
+        image_files = self.find_images(images_folder)
+        
+        if not image_files:
+            raise ValueError(f"No image files found in {images_folder}")
+            
+        for index, image_file in enumerate(image_files):
+            output_filename = (
+                f'{index}.txt' if self.config.rename_files 
+                else image_file.with_suffix('.txt').name
+            )
+            new_image_name = (
+                f"{index}{image_file.suffix}"
+                if self.config.rename_files
+                else image_file.name
+            )
+            self.file_mapping[image_file.name] = new_image_name
+
+            (self.label_output_dir / output_filename).touch()
+            self.log(f"Created empty annotation file: {output_filename}")
+
+    def copy_and_rename_images(self, source_folder: Path) -> None:
+        """Copy and optionally rename images to the temporary output folder"""
+        files = self.find_images(source_folder)
+        
+        if not files:
+            raise ValueError(f"No image files found in {source_folder}")
+            
+        for index, file_path in enumerate(files):
+            if self.config.rename_files:
+                new_filename = f"{index}{file_path.suffix.lower()}"
+            else:
+                new_filename = file_path.name
+                
+            new_path = self.image_output_dir / new_filename
+            shutil.copy2(file_path, new_path)
+            self.log(f"Copied {file_path.name} to {new_filename}")
+
+    def split_and_organize_dataset(self) -> None:
+        """Split dataset into train, val (and optional test) sets and organize files."""
+        if not self.config.add_to_dataset:
+            self.log("Skipping dataset organization (add_to_dataset=False)")
+            return
+
+        try:
+            dataset_name = self.config.dataset_name
+            # We'll gather final subset destinations here:
+            train_image_dir = self.config.dataset_base / 'images' / 'train' / dataset_name
+            val_image_dir   = self.config.dataset_base / 'images' / 'val' / dataset_name
+            train_label_dir = self.config.dataset_base / 'labels' / 'train' / dataset_name
+            val_label_dir   = self.config.dataset_base / 'labels' / 'val' / dataset_name
+
+            test_image_dir = None
+            test_label_dir = None
+            if self.config.test_split_ratio > 0:
+                test_image_dir = self.config.dataset_base / 'images' / 'test' / dataset_name
+                test_label_dir = self.config.dataset_base / 'labels' / 'test' / dataset_name
+
+            # Collect all files from the temporary image_output_dir / label_output_dir
+            image_files = sorted(os.listdir(self.image_output_dir))
+            label_files = sorted(os.listdir(self.label_output_dir))
+            
+            if not image_files:
+                raise ValueError("No image files found in output directory")
+            if not label_files:
+                raise ValueError("No label files found in output directory")
+                
+            if len(image_files) != len(label_files):
+                raise ValueError(
+                    f"Mismatch between number of images ({len(image_files)}) "
+                    f"and labels ({len(label_files)})"
+                )
+            
+            self.log(
+                f"Splitting {len(image_files)} files into train/val sets for dataset '{dataset_name}'..."
+            )
+            
+            total_split_ratio = self.config.val_split_ratio + self.config.test_split_ratio
+            if total_split_ratio >= 1:
+                raise ValueError("Combined validation and test split ratios must be less than 1.0")
+                
+            # Check we have enough samples to split
+            min_ratio = min(
+                r for r in [self.config.val_split_ratio, self.config.test_split_ratio]
+                if r > 0
+            ) if (self.config.val_split_ratio > 0 or self.config.test_split_ratio > 0) else 0
+            if min_ratio > 0:
+                min_samples = max(2, int(1 / min_ratio))
+                if len(image_files) < min_samples:
+                    raise ValueError(
+                        f"Not enough samples for split. Need at least {min_samples} files, "
+                        f"but only found {len(image_files)}"
+                    )
+            
+            # Perform train/val/test split
+            if self.config.test_split_ratio > 0:
+                # First split out the test set
+                remaining_ratio = 1 - self.config.test_split_ratio
+                relative_val_ratio = (
+                    self.config.val_split_ratio / remaining_ratio
+                    if remaining_ratio > 0
+                    else 0
+                )
+                
+                train_val_images, test_images = train_test_split(
+                    image_files,
+                    test_size=self.config.test_split_ratio,
+                    random_state=self.config.random_seed
+                )
+                train_val_labels, test_labels = train_test_split(
+                    label_files,
+                    test_size=self.config.test_split_ratio,
+                    random_state=self.config.random_seed
+                )
+                
+                # Then split train vs val from the remainder
+                train_images, val_images = train_test_split(
+                    train_val_images,
+                    test_size=relative_val_ratio,
+                    random_state=self.config.random_seed
+                )
+                train_labels, val_labels = train_test_split(
+                    train_val_labels,
+                    test_size=relative_val_ratio,
+                    random_state=self.config.random_seed
+                )
+            else:
+                train_images, val_images = train_test_split(
+                    image_files,
+                    test_size=self.config.val_split_ratio,
+                    random_state=self.config.random_seed
+                )
+                train_labels, val_labels = train_test_split(
+                    label_files,
+                    test_size=self.config.val_split_ratio,
+                    random_state=self.config.random_seed
+                )
+                test_images = []
+                test_labels = []
+            
+            self.log(
+                f"Split complete for '{dataset_name}': "
+                f"{len(train_images)} training files, "
+                f"{len(val_images)} validation files"
+                + (f", {len(test_images)} test files" if self.config.test_split_ratio > 0 else "")
+            )
+
+            # Create final directories if they don't exist
+            train_image_dir.mkdir(parents=True, exist_ok=True)
+            val_image_dir.mkdir(parents=True, exist_ok=True)
+            train_label_dir.mkdir(parents=True, exist_ok=True)
+            val_label_dir.mkdir(parents=True, exist_ok=True)
+            if test_image_dir and test_label_dir:
+                test_image_dir.mkdir(parents=True, exist_ok=True)
+                test_label_dir.mkdir(parents=True, exist_ok=True)
+
+            # Helper to move files from the temporary location to the final subset directories
+            def move_files(file_list, source_dir, dest_dir):
+                for fn in file_list:
+                    src_file = source_dir / fn
+                    dst_file = dest_dir / fn
+                    if not dst_file.exists():
+                        shutil.move(str(src_file), str(dst_file))
+
+            # Move images
+            move_files(train_images, self.image_output_dir, train_image_dir)
+            move_files(val_images,   self.image_output_dir, val_image_dir)
+            if test_image_dir:
+                move_files(test_images, self.image_output_dir, test_image_dir)
+
+            # Move labels
+            move_files(train_labels, self.label_output_dir, train_label_dir)
+            move_files(val_labels,   self.label_output_dir, val_label_dir)
+            if test_label_dir:
+                move_files(test_labels, self.label_output_dir, test_label_dir)
+
+            self.log(f"Dataset organization completed successfully for '{dataset_name}'!")
+
+            output_yaml_path = self.config.dataset_base / "data.yaml"  # or your own path
+            create_or_update_yolo_yaml(
+                dataset_base=self.config.dataset_base,
+                label_mapping=self.config.label_mapping,
+                output_yaml_path=output_yaml_path,
+                add_to_dataset=True  # or False to overwrite
+            )
+            self.log(f"YOLO data.yaml updated/created at {output_yaml_path}")
+
+        except Exception as e:
+            print(f"Error during dataset organization: {str(e)}")
+            raise
+
+    def process(self) -> None:
+        """Main processing function"""
+        # Find all CVAT COCO folders
+        cvat_folders = self.find_cvat_coco_folders(self.config.input_path)
+        
+        if not cvat_folders:
+            raise ValueError(f"No valid CVAT COCO folders found in {self.config.input_path}")
+        
+        self.log(f"Found {len(cvat_folders)} CVAT COCO folder(s):")
+        for folder in cvat_folders:
+            self.log(f"  - {folder.name}")
+
+        # Process each folder
+        for folder in cvat_folders:
+            try:
+                self.log(f"\nProcessing folder: {folder.name}")
+                
+                # Create a new config for this folder
+                folder_config = DatasetConfig(
+                    input_path=folder,
+                    dataset_base=self.config.dataset_base,
+                    output_base=self.config.output_base,
+                    val_split_ratio=self.config.val_split_ratio,
+                    test_split_ratio=self.config.test_split_ratio,
+                    add_to_dataset=self.config.add_to_dataset,
+                    label_mapping=self.config.label_mapping,
+                    random_seed=self.config.random_seed,
+                    rename_files=self.config.rename_files,
+                    dataset_name=folder.name
+                )
+                
+                # Create a new converter instance for this folder
+                folder_converter = COCOtoYOLOConverter(folder_config, self.progress_signal)
+                folder_converter.process_single_folder(folder_config)
+                
+            except Exception as e:
+                self.log(f"Error processing folder {folder.name}: {str(e)}")
+                # Continue with next folder instead of stopping
+                continue
+
+    def process_single_folder(self, config: DatasetConfig) -> None:
+        """Process a single CVAT COCO folder"""
+        images_folder = config.input_path / 'images'
+        annotations_folder = config.input_path / 'annotations'
+
+        # Validate input paths
+        if not images_folder.exists():
+            raise FileNotFoundError(f"Images directory not found: {images_folder}")
+        
+        self.setup_directories()
+
+        # Check for images before proceeding
+        image_files = self.find_images(images_folder)
+        if not image_files:
+            raise ValueError(f"No image files (jpg, jpeg, png) found in {images_folder}")
+        
+        self.log(f"Found {len(image_files)} images in {images_folder}")
+
+        try:
+            # Process annotations if they exist
+            if annotations_folder.exists():
+                json_files = list(annotations_folder.glob('*.json'))
+                if json_files:
+                    self.log(f"Found annotation file: {json_files[0].name}")
+                    
+                    # Check for missing mappings before proceeding with conversion
+                    missing_categories = self.check_missing_mappings(json_files[0])
+                    if missing_categories:
+                        raise ValueError("Missing category mappings must be addressed before conversion")
+                        
+                    self.convert_annotations(json_files[0])
+                else:
+                    self.log(f"No JSON files found in {annotations_folder}, creating empty annotations")
+                    self.process_empty_annotations(images_folder)
+            else:
+                self.log("No annotations folder found, creating empty annotations")
+                self.process_empty_annotations(images_folder)
+
+            # Copy and rename images
+            self.copy_and_rename_images(images_folder)
+            
+            # Ensure we have files to organize
+            if not os.path.exists(self.image_output_dir) or not os.listdir(self.image_output_dir):
+                raise ValueError("No images were processed successfully")
+            if not os.path.exists(self.label_output_dir) or not os.listdir(self.label_output_dir):
+                raise ValueError("No labels were generated successfully")
+                
+            # Split / organize
+            self.split_and_organize_dataset()
+            
+        except Exception as e:
+            self.log(f"Error during processing: {str(e)}")
+            raise
+        finally:
+            # Clean up the temporary directory if we did not use an explicit output_base
+            if config.output_base is None:
+                temp_dir = config.dataset_base / "__temp__" / config.dataset_name
+                if temp_dir.exists():
+                    self.log(f"Cleaning up temporary folder: {temp_dir}")
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                
+                # If __temp__ is now empty, remove it
+                parent_temp = config.dataset_base / "__temp__"
+                if parent_temp.exists():
+                    try:
+                        parent_temp.rmdir()  # Will only succeed if empty
+                    except OSError:
+                        pass  # It's not empty, so just leave it
+
+class ConversionWorker(QThread):
+    progress = pyqtSignal(str)
+    error = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+    def run(self):
+        try:
+            # Pass the progress signal to the converter
+            converter = COCOtoYOLOConverter(self.config, self.progress)
+            converter.process()
+            self.finished.emit()
+        except Exception as e:
+            self.error.emit(str(e))
+
+class LabelMappingTable(QTableWidget):
+    """Custom table widget for managing label mappings"""
+    def __init__(self):
+        super().__init__()
+        self.setColumnCount(2)
+        self.setHorizontalHeaderLabels(["Category Name", "YOLO ID"])
+        self.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.setColumnWidth(1, 100)
+
+    def get_mapping(self):
+        """Get the current mapping as a dictionary"""
+        mapping = {}
+        for row in range(self.rowCount()):
+            category_item = self.item(row, 0)
+            yolo_id_item = self.item(row, 1)
+            if category_item and yolo_id_item:
+                category = category_item.text().strip()
+                yolo_id = yolo_id_item.text().strip()
+                if yolo_id:  # Only include if YOLO ID is specified
+                    mapping[category] = yolo_id
+        return mapping
+
+    def set_mapping(self, mapping):
+        """Set the mapping from a dictionary"""
+        self.setRowCount(len(mapping))
+        for row, (category, yolo_id) in enumerate(mapping.items()):
+            self.setItem(row, 0, QTableWidgetItem(category))
+            self.setItem(row, 1, QTableWidgetItem(str(yolo_id)))
+
+    def load_categories(self, categories):
+        """Load COCO categories into the table"""
+        self.setRowCount(len(categories))
+        for row, category in enumerate(categories):
+            self.setItem(row, 0, QTableWidgetItem(category))
+            self.setItem(row, 1, QTableWidgetItem(str(row)))  # Default sequential numbering
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("COCO to YOLO Converter")
+        self.setMinimumWidth(1000)
+        self.setupUI()
+        
+    def setupUI(self):
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QHBoxLayout(central_widget)
+
+        # Left side container for all groups except mapping
+        left_container = QVBoxLayout()
+
+        # --- Path configuration group ---
+        path_group = QGroupBox("Path Configuration")
+        path_layout = QVBoxLayout()
+
+        # Input path
+        input_layout = QHBoxLayout()
+        self.input_path = QLineEdit()
+        self.input_path.setPlaceholderText(
+            "Select a CVAT COCO folder or parent folder containing multiple CVAT COCO folders"
+        )
+        self.input_path.textChanged.connect(self.input_path_changed)
+        self.input_path.textChanged.connect(self.update_convert_button_state)
+        input_button = QPushButton("Browse...")
+        input_button.clicked.connect(lambda: self.browse_folder(self.input_path))
+        input_layout.addWidget(QLabel("Input Path:"))
+        input_layout.addWidget(self.input_path)
+        input_layout.addWidget(input_button)
+        path_layout.addLayout(input_layout)
+
+        # Output base path with checkbox to the side
+        output_layout = QHBoxLayout()
+        output_path_layout = QHBoxLayout()
+        output_path_layout.addWidget(QLabel("Output Base:"))
+        self.output_base = QLineEdit()
+        self.output_base.textChanged.connect(self.update_convert_button_state)
+        self.output_base.setEnabled(False)  # Initially disabled
+        output_path_layout.addWidget(self.output_base)
+        self.output_browse_button = QPushButton("Browse...")
+        self.output_browse_button.clicked.connect(lambda: self.browse_folder(self.output_base))
+        self.output_browse_button.setEnabled(False)  # Initially disabled
+        output_path_layout.addWidget(self.output_browse_button)
+        self.use_output_base = QCheckBox()
+        self.use_output_base.stateChanged.connect(self.update_convert_button_state)
+        self.use_output_base.stateChanged.connect(self.toggle_output_base)
+        output_path_layout.addWidget(self.use_output_base)
+        output_layout.addLayout(output_path_layout)
+        path_layout.addLayout(output_layout)
+
+        # Dataset base path + "Add to dataset" checkbox
+        dataset_layout = QHBoxLayout()
+        self.dataset_base = QLineEdit()
+        self.dataset_base.textChanged.connect(self.update_convert_button_state)
+        self.dataset_button = QPushButton("Browse...")
+        self.dataset_button.clicked.connect(lambda: self.browse_folder(self.dataset_base))
+        dataset_button_label = QLabel("Dataset Base:")
+        dataset_layout.addWidget(dataset_button_label)
+        dataset_layout.addWidget(self.dataset_base)
+        dataset_layout.addWidget(self.dataset_button)
+
+        # Checkbox for "Add to Dataset" next to dataset base
+        self.add_to_dataset = QCheckBox()
+        self.add_to_dataset.setChecked(True)
+        self.use_output_base.stateChanged.connect(self.toggle_dataset_base)
+        self.add_to_dataset.stateChanged.connect(self.update_convert_button_state)
+        dataset_layout.addWidget(self.add_to_dataset)
+
+        path_layout.addLayout(dataset_layout)
+        path_group.setLayout(path_layout)
+        left_container.addWidget(path_group)
+
+        # --- Configuration group (Split ratios, Random Seed) ---
+        config_group = QGroupBox("Configuration")
+        config_layout = QVBoxLayout()
+
+        # Validation split ratio
+        val_layout = QHBoxLayout()
+        self.val_split = QDoubleSpinBox()
+        self.val_split.setRange(0.0, 1.0)
+        self.val_split.setSingleStep(0.1)
+        self.val_split.setValue(0.2)
+        val_layout.addWidget(QLabel("Validation Split Ratio:"))
+        val_layout.addWidget(self.val_split)
+        config_layout.addLayout(val_layout)
+
+        # Test split ratio
+        test_layout = QHBoxLayout()
+        self.test_split = QDoubleSpinBox()
+        self.test_split.setRange(0.0, 1.0)
+        self.test_split.setSingleStep(0.1)
+        self.test_split.setValue(0.0)
+        test_layout.addWidget(QLabel("Test Split Ratio:"))
+        test_layout.addWidget(self.test_split)
+        config_layout.addLayout(test_layout)
+
+        # Random seed
+        seed_layout = QHBoxLayout()
+        self.random_seed = QSpinBox()
+        self.random_seed.setRange(0, 99999)
+        self.random_seed.setValue(42)
+        seed_layout.addWidget(QLabel("Random Seed:"))
+        seed_layout.addWidget(self.random_seed)
+        config_layout.addLayout(seed_layout)
+
+        config_group.setLayout(config_layout)
+        left_container.addWidget(config_group)
+
+        # Log output
+        self.log_output = QTextEdit()
+        self.log_output.setReadOnly(True)
+        left_container.addWidget(self.log_output)
+
+        # Convert button
+        self.convert_button = QPushButton("Convert")
+        self.convert_button.setEnabled(False)
+        self.convert_button.clicked.connect(self.start_conversion)
+        left_container.addWidget(self.convert_button)
+
+        # Right side - Label Mapping
+        mapping_group = QGroupBox("Label Mapping")
+        mapping_layout = QVBoxLayout()
+        self.mapping_table = LabelMappingTable()
+        mapping_layout.addWidget(self.mapping_table)
+        mapping_group.setLayout(mapping_layout)
+
+        # Add both containers to main layout
+        main_layout.addLayout(left_container, stretch=60)
+        main_layout.addWidget(mapping_group, stretch=40)
+
+    def input_path_changed(self, new_path):
+        """Handle input path changes and try to load JSON automatically"""
+        if not new_path:  # Skip if path is empty
+            return
+            
+        path = Path(new_path)
+        if not path.exists():  # Skip if path doesn't exist
+            return
+            
+        # Clear existing categories
+        self.mapping_table.setRowCount(0)
+        
+        def process_cvat_folder(folder):
+            json_files = list((folder / "annotations").glob("*.json"))
+            if json_files:
+                self.load_categories_from_file(json_files[0])
+        
+        # Check if the path is a CVAT folder itself
+        if (path / "annotations").exists() and (path / "images").exists():
+            process_cvat_folder(path)
+        else:
+            # Look for CVAT folders in immediate subdirectories only
+            for item in path.iterdir():
+                if (
+                    item.is_dir() and 
+                    (item / "annotations").exists() and 
+                    (item / "images").exists()
+                ):
+                    process_cvat_folder(item)
+
+    def update_convert_button_state(self):
+        # Basic flags
+        have_input_path = bool(self.input_path.text().strip())
+        have_dataset_base = bool(self.dataset_base.text().strip())
+        
+        # Only consider output_base if the checkbox is checked
+        want_output_base = self.use_output_base.isChecked()
+        have_output_base = bool(self.output_base.text().strip()) if want_output_base else False
+        
+        add_to_dataset_checked = self.add_to_dataset.isChecked()
+        
+        # If no dataset base AND no output base, we can't proceed
+        if not have_dataset_base and not have_output_base:
+            can_convert = False
+        # If we have dataset_base but do not have output_base, and not adding to dataset => can't proceed
+        elif have_dataset_base and not have_output_base and not add_to_dataset_checked:
+            can_convert = False
+        else:
+            # Otherwise we have a valid place to save and an input path
+            can_convert = have_input_path
+
+        self.convert_button.setEnabled(can_convert)
+
+    def load_categories_from_file(self, json_path):
+        """Load categories from a specific JSON file and merge with existing ones"""
+        try:
+            with open(json_path) as f:
+                data = json.load(f)
+            
+            # Get existing categories
+            existing_categories = set()
+            for row in range(self.mapping_table.rowCount()):
+                category_item = self.mapping_table.item(row, 0)
+                if category_item:
+                    existing_categories.add(category_item.text())
+            
+            # Add new categories
+            new_categories = set(cat['name'] for cat in data['categories']) - existing_categories
+            if new_categories:
+                current_row_count = self.mapping_table.rowCount()
+                self.mapping_table.setRowCount(current_row_count + len(new_categories))
+                
+                for i, category in enumerate(new_categories, start=current_row_count):
+                    self.mapping_table.setItem(i, 0, QTableWidgetItem(category))
+                    self.mapping_table.setItem(i, 1, QTableWidgetItem(str(i)))
+                
+                self.log_message(f"Added {len(new_categories)} new categories from {json_path.name}")
+            
+        except Exception as e:
+            self.log_message(f"Failed to load categories from {json_path.name}: {str(e)}")
+
+    def browse_folder(self, line_edit):
+        folder = QFileDialog.getExistingDirectory(self, "Select Directory")
+        if folder:
+            line_edit.setText(folder)
+
+    def log_message(self, message):
+        self.log_output.append(message)
+
+    def show_error(self, message):
+        QMessageBox.critical(self, "Error", message)
+        self.convert_button.setEnabled(True)
+
+    def conversion_finished(self):
+        self.log_message("Conversion completed successfully!")
+        self.convert_button.setEnabled(True)
+
+    def start_conversion(self):
+        try:
+            # Validate inputs
+            if not self.input_path.text() or not self.dataset_base.text():
+                raise ValueError("Input path and dataset base must be specified")
+
+            # Output base is optional
+            output_base = self.output_base.text() if self.use_output_base.isChecked() else None
+
+            label_mapping = self.mapping_table.get_mapping()
+            if not label_mapping:
+                raise ValueError("Label mapping cannot be empty")
+
+            config = DatasetConfig(
+                input_path=self.input_path.text(),
+                dataset_base=self.dataset_base.text(),
+                output_base=output_base,
+                val_split_ratio=self.val_split.value(),
+                test_split_ratio=self.test_split.value(),
+                add_to_dataset=self.add_to_dataset.isChecked(),
+                label_mapping=label_mapping,
+                random_seed=self.random_seed.value()
+            )
+
+            self.convert_button.setEnabled(False)
+            self.log_output.clear()
+            self.log_message("Starting conversion...")
+
+            # Create and start worker thread
+            self.worker = ConversionWorker(config)
+            self.worker.progress.connect(self.log_message)
+            self.worker.error.connect(self.show_error)
+            self.worker.finished.connect(self.conversion_finished)
+            self.worker.start()
+
+        except Exception as e:
+            self.show_error(str(e))
+
+    def toggle_output_base(self, state):
+        """Enable/disable output base widgets based on checkbox state"""
+        enabled = bool(state)  # Convert Qt.CheckState to boolean
+        self.output_base.setEnabled(enabled)
+        self.output_browse_button.setEnabled(enabled)
+        if not enabled:
+            self.output_base.clear()  # Clear the text when disabled
+    
+    def toggle_dataset_base(self, state):
+        """
+        Enable/disable dataset_base if user unchecks "Add to Dataset".
+        Adjust as needed for your UI logic. Currently leaving as-is.
+        """
+        pass
+
+def main():
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()
