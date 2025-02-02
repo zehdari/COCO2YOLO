@@ -5,7 +5,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QLineEdit, QFileDialog, QSpinBox,
     QDoubleSpinBox, QTextEdit, QGroupBox, QMessageBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QTextBrowser, 
-    QTabWidget
+    QTabWidget, QCheckBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 import json
@@ -126,6 +126,7 @@ class DatasetConfig:
     random_seed: int = 42
     rename_files: bool = True
     dataset_name: Optional[str] = None
+    create_yaml: bool = True
 
     def __post_init__(self):
         self.input_path = Path(self.input_path)
@@ -451,13 +452,16 @@ class COCOtoYOLOConverter:
 
             self.log(f"Dataset organization completed successfully for '{dataset_name}'!")
 
-            output_yaml_path = self.config.dataset_base / "data.yaml"  # or your own path
-            create_or_update_yolo_yaml(
-                dataset_base=self.config.dataset_base,
-                label_mapping=self.config.label_mapping,
-                output_yaml_path=output_yaml_path,
-            )
-            self.log(f"YOLO data.yaml updated/created at {output_yaml_path}")
+            if self.config.create_yaml:
+                output_yaml_path = self.config.dataset_base / "data.yaml"
+                create_or_update_yolo_yaml(
+                    dataset_base=self.config.dataset_base,
+                    label_mapping=self.config.label_mapping,
+                    output_yaml_path=output_yaml_path,
+                )
+                self.log(f"YOLO data.yaml updated/created at {output_yaml_path}")
+            else:
+                self.log("Skipping YAML updating/creation")
 
         except Exception as e:
             print(f"Error during dataset organization: {str(e)}")
@@ -489,7 +493,8 @@ class COCOtoYOLOConverter:
                     label_mapping=self.config.label_mapping,
                     random_seed=self.config.random_seed,
                     rename_files=self.config.rename_files,
-                    dataset_name=folder.name
+                    dataset_name=folder.name,
+                    create_yaml=self.config.create_yaml
                 )
                 
                 # Create a new converter instance for this folder
@@ -745,6 +750,10 @@ class MainWindow(QMainWindow):
         self.convert_button.setEnabled(False)
         self.convert_button.clicked.connect(self.start_conversion)
         left_container.addWidget(self.convert_button)
+
+        self.create_yaml_toggle = QCheckBox("Create/Update data.yaml")
+        self.create_yaml_toggle.setChecked(True)
+        left_container.addWidget(self.create_yaml_toggle)
         
         conversion_layout.addLayout(left_container, stretch=60)
         
@@ -881,8 +890,11 @@ class MainWindow(QMainWindow):
                 val_split_ratio=self.val_split.value(),
                 test_split_ratio=self.test_split.value(),
                 label_mapping=label_mapping,
-                random_seed=self.random_seed.value()
+                random_seed=self.random_seed.value(),
+                create_yaml=self.create_yaml_toggle.isChecked()
             )
+
+            self.log_message(f"Create YAML file: {'Yes' if self.create_yaml_toggle.isChecked() else 'No'}")
 
             self.convert_button.setEnabled(False)
             self.log_output.clear()
