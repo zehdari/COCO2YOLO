@@ -397,24 +397,17 @@ def process_video_dataset(
                 video_images_dir.mkdir(parents=True, exist_ok=True)
                 video_labels_dir.mkdir(parents=True, exist_ok=True)
                 
-                # Process all frames for this video in this split
-                for filename in video_files:
-                    # Remove video prefix to get original frame filename
-                    original_filename = filename.split('_', 1)[1]
-                    
-                    # Create label file
-                    label_filename = Path(original_filename).with_suffix('.txt').name
+                # Process all frames for this video in this split with sequential numbering
+                for idx, filename in enumerate(video_files, 1):
+                    # Use sequential numbering: 1.txt, 2.txt, etc.
+                    label_filename = f"{idx}.txt"
                     label_path = video_labels_dir / label_filename
                     
                     with open(label_path, 'w') as f:
                         f.write(all_annotations[filename])
                     
-                    # Create placeholder image file (since we don't have actual images)
-                    # You'll need to extract frames from videos separately
-                    image_filename = original_filename
-                    if not any(original_filename.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png']):
-                        image_filename += '.jpg'
-                    
+                    # Create placeholder image file with sequential numbering: 1.jpg, 2.jpg, etc.
+                    image_filename = f"{idx}.jpg"
                     placeholder_path = video_images_dir / image_filename
                     placeholder_path.touch()  # Create empty file as placeholder
         
