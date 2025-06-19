@@ -35,6 +35,42 @@ def coco_bbox_to_yolo(bbox: List[float], img_width: int, img_height: int) -> Tup
     return x_center_norm, y_center_norm, width_norm, height_norm
 
 
+def discover_label_mapping(zip_path: Path, temp_dir: Path) -> Dict[str, int]:
+    """
+    Extract COCO annotations from zip file and discover all categories.
+    Returns a mapping of category names to YOLO class IDs.
+    """
+    # Extract zip file
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(temp_dir)
+    
+    # Find the instances_default.json file
+    json_file = None
+    for root, dirs, files in os.walk(temp_dir):
+        for file in files:
+            if file == "instances_default.json":
+                json_file = Path(root) / file
+                break
+        if json_file:
+            break
+    
+    if not json_file or not json_file.exists():
+        raise FileNotFoundError(f"No instances_default.json found in {zip_path}")
+    
+    # Load COCO data
+    with open(json_file, 'r') as f:
+        coco_data = json.load(f)
+    
+    # Create label mapping from categories, sorted alphabetically for consistency
+    categories = sorted([cat['name'] for cat in coco_data['categories']])
+    label_mapping = {name: idx for idx, name in enumerate(categories)}
+    
+    print(f"Discovered {len(categories)} categories: {categories}")
+    print(f"Label mapping: {label_mapping}")
+    
+    return label_mapping
+
+
 def extract_and_convert_annotations(zip_path: Path, temp_dir: Path, label_mapping: Dict[str, int]) -> Dict[str, str]:
     """
     Extract COCO annotations from zip file and convert to YOLO format.
@@ -133,7 +169,6 @@ def create_yolo_yaml(dataset_base: Path, label_mapping: Dict[str, int]):
 def process_video_dataset(
     input_dir: Path,
     output_dir: Path,
-    label_mapping: Dict[str, int],
     val_split: float = 0.2,
     test_split: float = 0.0,
     random_seed: int = 42
@@ -144,7 +179,6 @@ def process_video_dataset(
     Args:
         input_dir: Directory containing videos and annotations folder
         output_dir: Output directory for YOLO dataset
-        label_mapping: Dictionary mapping category names to class IDs
         val_split: Fraction of data for validation
         test_split: Fraction of data for testing
         random_seed: Random seed for reproducible splits
@@ -178,6 +212,27 @@ def process_video_dataset(
     output_dir.mkdir(parents=True, exist_ok=True)
     temp_dir = output_dir / "__temp__"
     temp_dir.mkdir(exist_ok=True)
+    
+    # Discover label mapping from first available annotation file
+    label_mapping = None
+    for video_name in video_files:
+        zip_path = annotations_dir / f"{video_name}.zip"
+        if zip_path.exists():
+            print(f"Discovering categories from {video_name}...")
+            discovery_dir = temp_dir / "discovery"
+            discovery_dir.mkdir(exist_ok=True)
+            try:
+                label_mapping = discover_label_mapping(zip_path, discovery_dir)
+                break
+            except Exception as e:
+                print(f"Error discovering categories from {video_name}: {e}")
+                continue
+            finally:
+                if discovery_dir.exists():
+                    shutil.rmtree(discovery_dir)
+    
+    if label_mapping is None:
+        raise ValueError("Could not discover categories from any annotation files")
     
     all_annotations = {}
     
@@ -291,22 +346,10 @@ def main():
     
     args = parser.parse_args()
     
-    # Example label mapping - you'll need to modify this based on your categories
-    label_mapping = {
-        'person': 0,
-        'car': 1,
-        'bicycle': 2,
-        # Add your categories here
-    }
-    
-    print("IMPORTANT: Please modify the label_mapping dictionary in the script to match your categories!")
-    print(f"Current mapping: {label_mapping}")
-    
     try:
         process_video_dataset(
             input_dir=args.input_dir,
             output_dir=args.output_dir,
-            label_mapping=label_mapping,
             val_split=args.val_split,
             test_split=args.test_split,
             random_seed=args.seed
