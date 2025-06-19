@@ -319,46 +319,86 @@ def process_video_dataset(
                 video_groups[video_name] = []
             video_groups[video_name].append(filename)
         
-        # Split videos (not individual frames) into train/val/test
-        video_names = list(video_groups.keys())
+        print(f"Total videos found: {len(video_groups)}")
         
-        if test_split > 0:
-            train_val_videos, test_videos = train_test_split(
-                video_names, test_size=test_split, random_state=random_seed
-            )
-            train_videos, val_videos = train_test_split(
-                train_val_videos, test_size=val_split/(1-test_split), random_state=random_seed
-            )
-        else:
-            train_videos, val_videos = train_test_split(
-                video_names, test_size=val_split, random_state=random_seed
-            )
-            test_videos = []
+        # Split frames within each video between train/val/test
+        train_files_by_video = {}
+        val_files_by_video = {}
+        test_files_by_video = {}
         
-        # Count total frames for logging
-        train_frame_count = sum(len(video_groups[video]) for video in train_videos)
-        val_frame_count = sum(len(video_groups[video]) for video in val_videos)
-        test_frame_count = sum(len(video_groups[video]) for video in test_videos)
+        total_train_frames = 0
+        total_val_frames = 0
+        total_test_frames = 0
         
-        print(f"Video split: {len(train_videos)} train videos ({train_frame_count} frames), "
-              f"{len(val_videos)} val videos ({val_frame_count} frames), "
-              f"{len(test_videos)} test videos ({test_frame_count} frames)")
+        for video_name, video_files in video_groups.items():
+            num_frames = len(video_files)
+            print(f"Splitting {num_frames} frames from {video_name}")
+            
+            if num_frames == 1:
+                # Single frame goes to training
+                train_files_by_video[video_name] = video_files
+                val_files_by_video[video_name] = []
+                test_files_by_video[video_name] = []
+                total_train_frames += 1
+            elif num_frames == 2:
+                # With 2 frames: 1 train, 1 val
+                train_files_by_video[video_name] = video_files[:1]
+                val_files_by_video[video_name] = video_files[1:]
+                test_files_by_video[video_name] = []
+                total_train_frames += 1
+                total_val_frames += 1
+            else:
+                # Normal splitting for 3+ frames
+                if test_split > 0:
+                    train_val_files, test_files = train_test_split(
+                        video_files, test_size=test_split, random_state=random_seed
+                    )
+                    if len(train_val_files) >= 2:
+                        relative_val_ratio = val_split / (1 - test_split)
+                        train_files, val_files = train_test_split(
+                            train_val_files, test_size=relative_val_ratio, random_state=random_seed
+                        )
+                    else:
+                        train_files = train_val_files
+                        val_files = []
+                    test_files_by_video[video_name] = test_files
+                else:
+                    train_files, val_files = train_test_split(
+                        video_files, test_size=val_split, random_state=random_seed
+                    )
+                    test_files_by_video[video_name] = []
+                
+                train_files_by_video[video_name] = train_files
+                val_files_by_video[video_name] = val_files
+                
+                total_train_frames += len(train_files)
+                total_val_frames += len(val_files)
+                total_test_frames += len(test_files_by_video[video_name])
+            
+            print(f"  {video_name}: {len(train_files_by_video[video_name])} train, "
+                  f"{len(val_files_by_video[video_name])} val, "
+                  f"{len(test_files_by_video[video_name])} test frames")
+        
+        print(f"\nTotal frames split: {total_train_frames} train, {total_val_frames} val, {total_test_frames} test")
         
         # Create dataset directories with video subfolders
-        splits = [('train', train_videos), ('val', val_videos)]
-        if test_videos:
-            splits.append(('test', test_videos))
+        splits = [('train', train_files_by_video), ('val', val_files_by_video)]
+        if any(test_files_by_video.values()):
+            splits.append(('test', test_files_by_video))
         
-        for split_name, split_videos in splits:
-            for video_name in split_videos:
+        for split_name, files_by_video in splits:
+            for video_name, video_files in files_by_video.items():
+                if not video_files:  # Skip if no files for this split
+                    continue
+                    
                 # Create video-specific directories
                 video_images_dir = output_dir / 'images' / split_name / video_name
                 video_labels_dir = output_dir / 'labels' / split_name / video_name
                 video_images_dir.mkdir(parents=True, exist_ok=True)
                 video_labels_dir.mkdir(parents=True, exist_ok=True)
                 
-                # Process all frames for this video
-                for filename in video_groups[video_name]:
+                # Process all frames for this video in this split
+                for filename in video_files:
                     # Remove video prefix to get original frame filename
                     original_filename = filename.split('_', 1)[1]
                     
