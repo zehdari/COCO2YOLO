@@ -145,7 +145,7 @@ def extract_and_convert_annotations(zip_path: Path, temp_dir: Path, label_mappin
 
 
 def create_yolo_yaml(dataset_base: Path, label_mapping: Dict[str, int]):
-    """Create YOLO data.yaml file."""
+    """Create YOLO data.yaml file with video subfolder structure."""
     yaml_path = dataset_base / "data.yaml"
     
     # Get class names in order of their IDs
@@ -153,17 +153,51 @@ def create_yolo_yaml(dataset_base: Path, label_mapping: Dict[str, int]):
     for name, class_id in label_mapping.items():
         class_names[class_id] = name
     
+    # Find all video subfolders in train and val
+    train_paths = []
+    val_paths = []
+    test_paths = []
+    
+    train_dir = dataset_base / 'images' / 'train'
+    val_dir = dataset_base / 'images' / 'val'
+    test_dir = dataset_base / 'images' / 'test'
+    
+    if train_dir.exists():
+        for video_folder in sorted(train_dir.iterdir()):
+            if video_folder.is_dir():
+                train_paths.append(str(video_folder.resolve()))
+    
+    if val_dir.exists():
+        for video_folder in sorted(val_dir.iterdir()):
+            if video_folder.is_dir():
+                val_paths.append(str(video_folder.resolve()))
+    
+    if test_dir.exists():
+        for video_folder in sorted(test_dir.iterdir()):
+            if video_folder.is_dir():
+                test_paths.append(str(video_folder.resolve()))
+    
     data = {
-        'train': str(dataset_base / 'images' / 'train'),
-        'val': str(dataset_base / 'images' / 'val'),
         'nc': len(label_mapping),
         'names': class_names
     }
+    
+    # Add paths in YOLO format
+    if train_paths:
+        data['train'] = train_paths
+    if val_paths:
+        data['val'] = val_paths
+    if test_paths:
+        data['test'] = test_paths
     
     with open(yaml_path, 'w') as f:
         yaml.dump(data, f, default_flow_style=False)
     
     print(f"Created YOLO data.yaml at {yaml_path}")
+    print(f"  Train videos: {len(train_paths)}")
+    print(f"  Val videos: {len(val_paths)}")
+    if test_paths:
+        print(f"  Test videos: {len(test_paths)}")
 
 
 def process_video_dataset(
@@ -276,53 +310,73 @@ def process_video_dataset(
         
         print(f"Total processed frames: {len(all_annotations)}")
         
-        # Split data into train/val/test
-        filenames = list(all_annotations.keys())
+        # Group files by video name for splitting
+        video_groups = {}
+        for filename in all_annotations.keys():
+            # Extract video name from prefixed filename (e.g., "video1_frame_001.jpg" -> "video1")
+            video_name = filename.split('_', 1)[0]
+            if video_name not in video_groups:
+                video_groups[video_name] = []
+            video_groups[video_name].append(filename)
+        
+        # Split videos (not individual frames) into train/val/test
+        video_names = list(video_groups.keys())
         
         if test_split > 0:
-            train_val_files, test_files = train_test_split(
-                filenames, test_size=test_split, random_state=random_seed
+            train_val_videos, test_videos = train_test_split(
+                video_names, test_size=test_split, random_state=random_seed
             )
-            train_files, val_files = train_test_split(
-                train_val_files, test_size=val_split/(1-test_split), random_state=random_seed
+            train_videos, val_videos = train_test_split(
+                train_val_videos, test_size=val_split/(1-test_split), random_state=random_seed
             )
         else:
-            train_files, val_files = train_test_split(
-                filenames, test_size=val_split, random_state=random_seed
+            train_videos, val_videos = train_test_split(
+                video_names, test_size=val_split, random_state=random_seed
             )
-            test_files = []
+            test_videos = []
         
-        print(f"Data split: {len(train_files)} train, {len(val_files)} val, {len(test_files)} test")
+        # Count total frames for logging
+        train_frame_count = sum(len(video_groups[video]) for video in train_videos)
+        val_frame_count = sum(len(video_groups[video]) for video in val_videos)
+        test_frame_count = sum(len(video_groups[video]) for video in test_videos)
         
-        # Create dataset directories
-        splits = [('train', train_files), ('val', val_files)]
-        if test_files:
-            splits.append(('test', test_files))
+        print(f"Video split: {len(train_videos)} train videos ({train_frame_count} frames), "
+              f"{len(val_videos)} val videos ({val_frame_count} frames), "
+              f"{len(test_videos)} test videos ({test_frame_count} frames)")
         
-        for split_name, split_files in splits:
-            # Create directories
-            images_dir = output_dir / 'images' / split_name
-            labels_dir = output_dir / 'labels' / split_name
-            images_dir.mkdir(parents=True, exist_ok=True)
-            labels_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Create label files
-            for filename in split_files:
-                # Create label file
-                label_filename = Path(filename).with_suffix('.txt').name
-                label_path = labels_dir / label_filename
+        # Create dataset directories with video subfolders
+        splits = [('train', train_videos), ('val', val_videos)]
+        if test_videos:
+            splits.append(('test', test_videos))
+        
+        for split_name, split_videos in splits:
+            for video_name in split_videos:
+                # Create video-specific directories
+                video_images_dir = output_dir / 'images' / split_name / video_name
+                video_labels_dir = output_dir / 'labels' / split_name / video_name
+                video_images_dir.mkdir(parents=True, exist_ok=True)
+                video_labels_dir.mkdir(parents=True, exist_ok=True)
                 
-                with open(label_path, 'w') as f:
-                    f.write(all_annotations[filename])
-                
-                # Create placeholder image file (since we don't have actual images)
-                # You'll need to extract frames from videos separately
-                image_filename = filename
-                if not any(filename.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png']):
-                    image_filename += '.jpg'
-                
-                placeholder_path = images_dir / image_filename
-                placeholder_path.touch()  # Create empty file as placeholder
+                # Process all frames for this video
+                for filename in video_groups[video_name]:
+                    # Remove video prefix to get original frame filename
+                    original_filename = filename.split('_', 1)[1]
+                    
+                    # Create label file
+                    label_filename = Path(original_filename).with_suffix('.txt').name
+                    label_path = video_labels_dir / label_filename
+                    
+                    with open(label_path, 'w') as f:
+                        f.write(all_annotations[filename])
+                    
+                    # Create placeholder image file (since we don't have actual images)
+                    # You'll need to extract frames from videos separately
+                    image_filename = original_filename
+                    if not any(original_filename.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png']):
+                        image_filename += '.jpg'
+                    
+                    placeholder_path = video_images_dir / image_filename
+                    placeholder_path.touch()  # Create empty file as placeholder
         
         # Create YOLO yaml file
         create_yolo_yaml(output_dir, label_mapping)
