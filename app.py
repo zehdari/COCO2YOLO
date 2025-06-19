@@ -5,17 +5,19 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QLineEdit, QFileDialog, QSpinBox,
     QDoubleSpinBox, QTextEdit, QGroupBox, QMessageBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QTextBrowser, 
-    QTabWidget, QCheckBox
+    QTabWidget, QCheckBox, QDialog, QDialogButtonBox, QListWidget,
+    QListWidgetItem, QSplitter
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import shutil
 import os
 import markdown
 import yaml
 from typing import Dict, Optional, List, Tuple, Set
 from sklearn.model_selection import train_test_split
+import re
 
 def resource_path(relative_path):
     """Get absolute path to resource, works for dev and for PyInstaller."""
@@ -27,6 +29,142 @@ def resource_path(relative_path):
         base_path = Path(os.path.abspath("."))
     return base_path / relative_path
 
+@dataclass
+class FrameRange:
+    """Represents a range of frames to include"""
+    start: int
+    end: int
+    
+    def __post_init__(self):
+        if self.start > self.end:
+            raise ValueError(f"Start frame {self.start} cannot be greater than end frame {self.end}")
+    
+    def contains(self, frame_num: int) -> bool:
+        """Check if a frame number is within this range"""
+        return self.start <= frame_num <= self.end
+    
+    def __str__(self):
+        return f"{self.start}-{self.end}"
+
+@dataclass
+class FolderConfig:
+    """Configuration for a specific folder"""
+    folder_path: Path
+    enabled: bool = True
+    frame_ranges: List[FrameRange] = field(default_factory=list)
+    
+    def should_include_frame(self, frame_num: int) -> bool:
+        """Check if a frame should be included based on the configured ranges"""
+        if not self.frame_ranges:  # If no ranges specified, include all frames
+            return True
+        return any(range.contains(frame_num) for range in self.frame_ranges)
+    
+    @staticmethod
+    def parse_frame_ranges(range_string: str) -> List[FrameRange]:
+        """Parse frame ranges from string like '0-280, 543-564, 668-679'"""
+        if not range_string.strip():
+            return []
+        
+        ranges = []
+        for part in range_string.split(','):
+            part = part.strip()
+            if '-' in part:
+                try:
+                    start, end = map(int, part.split('-', 1))
+                    ranges.append(FrameRange(start, end))
+                except ValueError:
+                    raise ValueError(f"Invalid range format: '{part}'. Expected format: 'start-end'")
+            elif part.isdigit():
+                # Single frame
+                frame = int(part)
+                ranges.append(FrameRange(frame, frame))
+            else:
+                raise ValueError(f"Invalid range format: '{part}'. Expected format: 'start-end' or single number")
+        
+        return ranges
+
+class FrameRangeDialog(QDialog):
+    """Dialog for configuring frame ranges for folders"""
+    
+    def __init__(self, folder_configs: List[FolderConfig], parent=None):
+        super().__init__(parent)
+        self.folder_configs = folder_configs
+        self.setWindowTitle("Configure Frame Ranges")
+        self.setMinimumSize(600, 400)
+        self.setupUI()
+        
+    def setupUI(self):
+        layout = QVBoxLayout(self)
+        
+        # Instructions
+        instructions = QLabel(
+            "Configure frame ranges for each folder. Leave empty to include all frames.\n"
+            "Format: '0-280, 543-564, 668-679' or single frames: '100, 200, 300'"
+        )
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
+        
+        # Table for folder configurations
+        self.table = QTableWidget()
+        self.table.setColumnCount(3)
+        self.table.setHorizontalHeaderLabels(["Folder", "Enabled", "Frame Ranges"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        
+        self.populate_table()
+        layout.addWidget(self.table)
+        
+        # Buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+    
+    def populate_table(self):
+        """Populate the table with folder configurations"""
+        self.table.setRowCount(len(self.folder_configs))
+        
+        for row, config in enumerate(self.folder_configs):
+            # Folder name
+            folder_item = QTableWidgetItem(config.folder_path.name)
+            folder_item.setFlags(folder_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table.setItem(row, 0, folder_item)
+            
+            # Enabled checkbox
+            enabled_item = QTableWidgetItem()
+            enabled_item.setCheckState(Qt.CheckState.Checked if config.enabled else Qt.CheckState.Unchecked)
+            enabled_item.setFlags(enabled_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table.setItem(row, 1, enabled_item)
+            
+            # Frame ranges
+            ranges_text = ", ".join(str(r) for r in config.frame_ranges)
+            ranges_item = QTableWidgetItem(ranges_text)
+            self.table.setItem(row, 2, ranges_item)
+    
+    def get_configurations(self) -> List[FolderConfig]:
+        """Get the updated configurations from the table"""
+        updated_configs = []
+        
+        for row in range(self.table.rowCount()):
+            config = self.folder_configs[row]
+            
+            # Update enabled status
+            enabled_item = self.table.item(row, 1)
+            config.enabled = enabled_item.checkState() == Qt.CheckState.Checked
+            
+            # Update frame ranges
+            ranges_item = self.table.item(row, 2)
+            ranges_text = ranges_item.text() if ranges_item else ""
+            
+            try:
+                config.frame_ranges = FolderConfig.parse_frame_ranges(ranges_text)
+            except ValueError as e:
+                raise ValueError(f"Error in folder '{config.folder_path.name}': {str(e)}")
+            
+            updated_configs.append(config)
+        
+        return updated_configs
 
 def create_or_update_yolo_yaml(
     dataset_base: Path,
@@ -127,6 +265,7 @@ class DatasetConfig:
     rename_files: bool = True
     dataset_name: Optional[str] = None
     create_yaml: bool = True
+    folder_configs: List[FolderConfig] = field(default_factory=list)
 
     def __post_init__(self):
         self.input_path = Path(self.input_path)
@@ -174,7 +313,6 @@ class COCOtoYOLOConverter:
         # Return the unique folders in sorted order
         return sorted(cvat_folders)
 
-
     def setup_directories(self) -> None:
         """Create necessary directories based on configuration"""
         dataset_name = self.config.dataset_name
@@ -198,27 +336,56 @@ class COCOtoYOLOConverter:
         """Emit a log message through the progress signal"""
         self.progress_signal.emit(message)
 
-    def convert_annotations(self, json_file_path: Path) -> None:
-        """Convert COCO JSON annotations to YOLO format"""
+    def get_frame_number_from_filename(self, filename: str) -> Optional[int]:
+        """Extract frame number from filename. Assumes format like 'frame_001.jpg' or '001.jpg'"""
+        # Try different patterns to extract frame numbers
+        patterns = [
+            r'frame_(\d+)',  # frame_001.jpg
+            r'(\d+)',        # 001.jpg or just numbers
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, filename)
+            if match:
+                try:
+                    return int(match.group(1))
+                except ValueError:
+                    continue
+        
+        return None
+
+    def convert_annotations(self, json_file_path: Path, folder_config: FolderConfig) -> None:
+        """Convert COCO JSON annotations to YOLO format with frame filtering"""
         try:
             with open(json_file_path) as f:
                 data = json.load(f)
 
             category_mapping = {cat['id']: cat['name'] for cat in data['categories']}
             
+            processed_count = 0
+            filtered_count = 0
+            
             for index, image in enumerate(data['images']):
+                # Extract frame number from filename
+                frame_num = self.get_frame_number_from_filename(image['file_name'])
+                
+                # Check if this frame should be included
+                if frame_num is not None and not folder_config.should_include_frame(frame_num):
+                    filtered_count += 1
+                    continue
+                
                 image_id = image['id']
                 img_width, img_height = image['width'], image['height']
                 annotations = [ann for ann in data['annotations'] if ann['image_id'] == image_id]
                 
                 output_filename = (
-                    f'{index}.txt' if self.config.rename_files 
+                    f'{processed_count}.txt' if self.config.rename_files 
                     else Path(image['file_name']).with_suffix('.txt').name
                 )
                 
                 # Map original image name to the new one
                 new_image_name = (
-                    f"{index}{Path(image['file_name']).suffix}"
+                    f"{processed_count}{Path(image['file_name']).suffix}"
                     if self.config.rename_files
                     else image['file_name']
                 )
@@ -237,6 +404,13 @@ class COCOtoYOLOConverter:
                                 " ".join(f"{x} {y}" for x, y in yolo_polygon)
                             )
                             f_lbl.write(line + '\n')
+                
+                processed_count += 1
+            
+            if filtered_count > 0:
+                self.log(f"Filtered out {filtered_count} frames based on frame ranges")
+            self.log(f"Processed {processed_count} frames from annotations")
+            
         except Exception as e:
             self.log(f"Error processing annotations: {str(e)}")
             raise
@@ -278,43 +452,74 @@ class COCOtoYOLOConverter:
             images.extend(list(folder.glob(pattern)))
         return sorted(images)
 
-    def process_empty_annotations(self, images_folder: Path) -> None:
-        """Create empty annotation files for images without annotations"""
+    def process_empty_annotations(self, images_folder: Path, folder_config: FolderConfig) -> None:
+        """Create empty annotation files for images without annotations, with frame filtering"""
         image_files = self.find_images(images_folder)
         
         if not image_files:
             raise ValueError(f"No image files found in {images_folder}")
+        
+        processed_count = 0
+        filtered_count = 0
+        
+        for image_file in image_files:
+            # Extract frame number from filename
+            frame_num = self.get_frame_number_from_filename(image_file.name)
             
-        for index, image_file in enumerate(image_files):
+            # Check if this frame should be included
+            if frame_num is not None and not folder_config.should_include_frame(frame_num):
+                filtered_count += 1
+                continue
+            
             output_filename = (
-                f'{index}.txt' if self.config.rename_files 
+                f'{processed_count}.txt' if self.config.rename_files 
                 else image_file.with_suffix('.txt').name
             )
             new_image_name = (
-                f"{index}{image_file.suffix}"
+                f"{processed_count}{image_file.suffix}"
                 if self.config.rename_files
                 else image_file.name
             )
             self.file_mapping[image_file.name] = new_image_name
 
             (self.label_output_dir / output_filename).touch()
-            self.log(f"Created empty annotation file: {output_filename}")
+            processed_count += 1
+        
+        if filtered_count > 0:
+            self.log(f"Filtered out {filtered_count} images based on frame ranges")
+        self.log(f"Created {processed_count} empty annotation files")
 
-    def copy_and_rename_images(self, source_folder: Path) -> None:
-        """Copy and optionally rename images to the temporary output folder"""
+    def copy_and_rename_images(self, source_folder: Path, folder_config: FolderConfig) -> None:
+        """Copy and optionally rename images to the temporary output folder, with frame filtering"""
         files = self.find_images(source_folder)
         
         if not files:
             raise ValueError(f"No image files found in {source_folder}")
+        
+        processed_count = 0
+        filtered_count = 0
+        
+        for file_path in files:
+            # Extract frame number from filename
+            frame_num = self.get_frame_number_from_filename(file_path.name)
             
-        for index, file_path in enumerate(files):
+            # Check if this frame should be included
+            if frame_num is not None and not folder_config.should_include_frame(frame_num):
+                filtered_count += 1
+                continue
+            
             if self.config.rename_files:
-                new_filename = f"{index}{file_path.suffix.lower()}"
+                new_filename = f"{processed_count}{file_path.suffix.lower()}"
             else:
                 new_filename = file_path.name
                 
             new_path = self.image_output_dir / new_filename
             shutil.copy2(file_path, new_path)
+            processed_count += 1
+        
+        if filtered_count > 0:
+            self.log(f"Filtered out {filtered_count} images based on frame ranges")
+        self.log(f"Copied {processed_count} images")
 
     def split_and_organize_dataset(self) -> None:
         """Split dataset into train, val (and optional test) sets and organize files."""
@@ -469,45 +674,46 @@ class COCOtoYOLOConverter:
 
     def process(self) -> None:
         """Main processing function"""
-        # Find all CVAT COCO folders
-        cvat_folders = self.find_cvat_coco_folders(self.config.input_path)
+        # Get enabled folder configs
+        enabled_configs = [config for config in self.config.folder_configs if config.enabled]
         
-        if not cvat_folders:
-            raise ValueError(f"No valid CVAT COCO folders found in {self.config.input_path}")
+        if not enabled_configs:
+            raise ValueError("No folders are enabled for processing")
         
-        self.log(f"Found {len(cvat_folders)} CVAT COCO folder(s):")
-        for folder in cvat_folders:
-            self.log(f"  - {folder.name}")
+        self.log(f"Processing {len(enabled_configs)} enabled folder(s):")
+        for config in enabled_configs:
+            range_info = f" (frames: {', '.join(str(r) for r in config.frame_ranges)})" if config.frame_ranges else " (all frames)"
+            self.log(f"  - {config.folder_path.name}{range_info}")
 
-        # Process each folder
-        for folder in cvat_folders:
+        # Process each enabled folder
+        for folder_config in enabled_configs:
             try:
-                self.log(f"\nProcessing folder: {folder.name}")
+                self.log(f"\nProcessing folder: {folder_config.folder_path.name}")
                 
                 # Create a new config for this folder
-                folder_config = DatasetConfig(
-                    input_path=folder,
+                single_folder_config = DatasetConfig(
+                    input_path=folder_config.folder_path,
                     dataset_base=self.config.dataset_base,
                     val_split_ratio=self.config.val_split_ratio,
                     test_split_ratio=self.config.test_split_ratio,
                     label_mapping=self.config.label_mapping,
                     random_seed=self.config.random_seed,
                     rename_files=self.config.rename_files,
-                    dataset_name=folder.name,
+                    dataset_name=folder_config.folder_path.name,
                     create_yaml=self.config.create_yaml
                 )
                 
                 # Create a new converter instance for this folder
-                folder_converter = COCOtoYOLOConverter(folder_config, self.progress_signal)
-                folder_converter.process_single_folder(folder_config)
+                folder_converter = COCOtoYOLOConverter(single_folder_config, self.progress_signal)
+                folder_converter.process_single_folder(single_folder_config, folder_config)
                 
             except Exception as e:
-                self.log(f"Error processing folder {folder.name}: {str(e)}")
+                self.log(f"Error processing folder {folder_config.folder_path.name}: {str(e)}")
                 # Continue with next folder instead of stopping
                 continue
 
-    def process_single_folder(self, config: DatasetConfig) -> None:
-        """Process a single CVAT COCO folder"""
+    def process_single_folder(self, config: DatasetConfig, folder_config: FolderConfig) -> None:
+        """Process a single CVAT COCO folder with frame filtering"""
         images_folder = config.input_path / 'images'
         annotations_folder = config.input_path / 'annotations'
 
@@ -537,16 +743,16 @@ class COCOtoYOLOConverter:
                     if missing_categories:
                         raise ValueError("Missing category mappings must be addressed before conversion")
                         
-                    self.convert_annotations(json_files[0])
+                    self.convert_annotations(json_files[0], folder_config)
                 else:
                     self.log(f"No JSON files found in {annotations_folder}, creating empty annotations")
-                    self.process_empty_annotations(images_folder)
+                    self.process_empty_annotations(images_folder, folder_config)
             else:
                 self.log("No annotations folder found, creating empty annotations")
-                self.process_empty_annotations(images_folder)
+                self.process_empty_annotations(images_folder, folder_config)
 
             # Copy and rename images
-            self.copy_and_rename_images(images_folder)
+            self.copy_and_rename_images(images_folder, folder_config)
             
             # Ensure we have files to organize
             if not os.path.exists(self.image_output_dir) or not os.listdir(self.image_output_dir):
@@ -554,7 +760,7 @@ class COCOtoYOLOConverter:
             if not os.path.exists(self.label_output_dir) or not os.listdir(self.label_output_dir):
                 raise ValueError("No labels were generated successfully")
                 
-            # 3) Split / organize
+            # Split / organize
             self.split_and_organize_dataset()
             
         except Exception as e:
@@ -573,35 +779,6 @@ class COCOtoYOLOConverter:
                     parent_temp.rmdir()  # Will only succeed if empty
                 except OSError:
                     pass
-
-    def check_target_folders_exist(self, config: DatasetConfig) -> None:
-        """
-        Construct the final train/val(/test) subfolder paths for this dataset
-        and raise an error if any already exist.
-        """
-        dataset_name = config.dataset_name
-        train_image_dir = config.dataset_base / 'images' / 'train' / dataset_name
-        val_image_dir   = config.dataset_base / 'images' / 'val' / dataset_name
-        train_label_dir = config.dataset_base / 'labels' / 'train' / dataset_name
-        val_label_dir   = config.dataset_base / 'labels' / 'val' / dataset_name
-
-        dirs_to_check = [train_image_dir, val_image_dir, train_label_dir, val_label_dir]
-
-        if config.test_split_ratio > 0:
-            test_image_dir = config.dataset_base / 'images' / 'test' / dataset_name
-            test_label_dir = config.dataset_base / 'labels' / 'test' / dataset_name
-            dirs_to_check.append(test_image_dir)
-            dirs_to_check.append(test_label_dir)
-
-        # Identify any folders that exist
-        already_existing = [str(d) for d in dirs_to_check if d.exists()]
-        if already_existing:
-            msg = (
-                "Refusing to proceed because the following target folder(s) "
-                "already exist for this dataset:\n"
-                + "\n".join(f" - {p}" for p in already_existing)
-            )
-            raise FileExistsError(msg)
 
 
 class ConversionWorker(QThread):
@@ -663,7 +840,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("COCO to YOLO Converter")
-        self.setMinimumWidth(1000)
+        self.setMinimumWidth(1200)
+        self.folder_configs = []
         self.setupUI()
         
     def setupUI(self):
@@ -675,8 +853,12 @@ class MainWindow(QMainWindow):
         conversion_tab = QWidget()
         conversion_layout = QHBoxLayout(conversion_tab)
         
-        # Left side container for groups (Path Config, Configuration, Log, Convert Button)
-        left_container = QVBoxLayout()
+        # Create splitter for better layout control
+        main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        
+        # Left side container for groups (Path Config, Configuration, Folder Selection, Log, Convert Button)
+        left_widget = QWidget()
+        left_container = QVBoxLayout(left_widget)
         
         # Path configuration group
         path_group = QGroupBox("Path Configuration")
@@ -685,7 +867,7 @@ class MainWindow(QMainWindow):
         input_layout = QHBoxLayout()
         self.input_path = QLineEdit()
         self.input_path.setPlaceholderText(
-            "Select COCO folder or parent containing COCO folders"
+            "Select parent folder containing COCO folders"
         )
         self.input_path.textChanged.connect(self.input_path_changed)
         self.input_path.textChanged.connect(self.update_convert_button_state)
@@ -740,30 +922,55 @@ class MainWindow(QMainWindow):
         config_group.setLayout(config_layout)
         left_container.addWidget(config_group)
         
+        # Folder Selection Group
+        folder_group = QGroupBox("Folder Selection & Frame Ranges")
+        folder_layout = QVBoxLayout()
+        
+        # Folder list
+        self.folder_list = QListWidget()
+        self.folder_list.setMaximumHeight(150)
+        folder_layout.addWidget(self.folder_list)
+        
+        # Configure ranges button
+        self.configure_ranges_button = QPushButton("Configure Frame Ranges...")
+        self.configure_ranges_button.setEnabled(False)
+        self.configure_ranges_button.clicked.connect(self.configure_frame_ranges)
+        folder_layout.addWidget(self.configure_ranges_button)
+        
+        folder_group.setLayout(folder_layout)
+        left_container.addWidget(folder_group)
+        
         # Log output
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
         left_container.addWidget(self.log_output)
         
-        # Convert button
+        # Convert button and YAML toggle
+        button_layout = QVBoxLayout()
+        self.create_yaml_toggle = QCheckBox("Create/Update data.yaml")
+        self.create_yaml_toggle.setChecked(True)
+        button_layout.addWidget(self.create_yaml_toggle)
+        
         self.convert_button = QPushButton("Convert")
         self.convert_button.setEnabled(False)
         self.convert_button.clicked.connect(self.start_conversion)
-        left_container.addWidget(self.convert_button)
-
-        self.create_yaml_toggle = QCheckBox("Create/Update data.yaml")
-        self.create_yaml_toggle.setChecked(True)
-        left_container.addWidget(self.create_yaml_toggle)
+        button_layout.addWidget(self.convert_button)
         
-        conversion_layout.addLayout(left_container, stretch=60)
+        left_container.addLayout(button_layout)
         
-        # Right side - Label Mapping (unchanged)
+        # Right side - Label Mapping
         mapping_group = QGroupBox("Label Mapping")
         mapping_layout = QVBoxLayout()
         self.mapping_table = LabelMappingTable()
         mapping_layout.addWidget(self.mapping_table)
         mapping_group.setLayout(mapping_layout)
-        conversion_layout.addWidget(mapping_group, stretch=40)
+        
+        # Add widgets to splitter
+        main_splitter.addWidget(left_widget)
+        main_splitter.addWidget(mapping_group)
+        main_splitter.setSizes([700, 500])  # Set initial sizes
+        
+        conversion_layout.addWidget(main_splitter)
         
         # Add the Conversion tab to the tab widget
         tab_widget.addTab(conversion_tab, "Conversion")
@@ -784,7 +991,7 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 markdown_text = f"# Error Loading Help File\n\n{str(e)}"
         else:
-            markdown_text = "# Help File Not Found\n\nPlease ensure 'help.md' exists in the correct location."
+            markdown_text = self.get_default_help_text()
 
         # Convert markdown to HTML and set the content of the viewer
         try:
@@ -794,96 +1001,164 @@ class MainWindow(QMainWindow):
             # Fallback: display plain text if conversion fails
             self.markdown_viewer.setPlainText(markdown_text)
 
+    def get_default_help_text(self):
+        """Return default help text if help.md is not found"""
+        return """# COCO to YOLO Converter with Frame Range Selection
+
+## Overview
+This tool converts COCO format annotations to YOLO format with support for selective frame processing.
+
+## Features
+- **Frame Range Selection**: Process specific frame ranges from each folder
+- **Batch Processing**: Handle multiple COCO folders at once
+- **Train/Val/Test Splitting**: Automatically organize data into training sets
+- **Label Mapping**: Map COCO categories to YOLO class IDs
+
+## Frame Range Format
+When configuring frame ranges, use the following formats:
+- Single frames: `100, 200, 300`
+- Frame ranges: `0-280, 543-564, 668-679`
+- Mixed: `0-100, 150, 200-300`
+
+## Usage
+1. Select input folder containing COCO datasets
+2. Choose output dataset base directory
+3. Configure frame ranges for each folder (optional)
+4. Set up label mappings
+5. Click Convert
+
+## Frame Number Detection
+The tool automatically detects frame numbers from filenames using patterns like:
+- `frame_001.jpg`
+- `001.jpg`
+- Any filename containing numbers
+
+If no frame ranges are specified, all frames will be processed.
+"""
+
     def input_path_changed(self, new_path):
-        """Handle input path changes and try to load JSON automatically"""
-        if not new_path:  # Skip if path is empty
+        """Handle input path changes and discover COCO folders"""
+        if not new_path:
+            self.folder_configs.clear()
+            self.update_folder_list()
             return
             
         path = Path(new_path)
-        if not path.exists():  # Skip if path doesn't exist
+        if not path.exists():
             return
-            
-        # Clear existing categories
+        
+        # Create a temporary converter to find COCO folders
+        temp_config = DatasetConfig(
+            input_path=path,
+            dataset_base=Path("/tmp"),  # Dummy path
+            label_mapping={"dummy": "0"}  # Dummy mapping
+        )
+        temp_converter = COCOtoYOLOConverter(temp_config, lambda x: None)
+        
+        # Find all COCO folders
+        coco_folders = temp_converter.find_cvat_coco_folders(path)
+        
+        # Create folder configs
+        self.folder_configs = [FolderConfig(folder_path=folder) for folder in coco_folders]
+        
+        # Update UI
+        self.update_folder_list()
+        self.configure_ranges_button.setEnabled(len(self.folder_configs) > 0)
+        
+        # Load categories from all folders
+        self.load_categories_from_folders()
+
+    def update_folder_list(self):
+        """Update the folder list display"""
+        self.folder_list.clear()
+        for config in self.folder_configs:
+            item = QListWidgetItem()
+            enabled_text = "✓" if config.enabled else "✗"
+            range_text = f" ({', '.join(str(r) for r in config.frame_ranges)})" if config.frame_ranges else ""
+            item.setText(f"{enabled_text} {config.folder_path.name}{range_text}")
+            self.folder_list.addItem(item)
+
+    def load_categories_from_folders(self):
+        """Load categories from all discovered COCO folders"""
         self.mapping_table.setRowCount(0)
         
-        def process_cvat_folder(folder):
-            json_files = list((folder / "annotations").glob("*.json"))
+        all_categories = set()
+        for config in self.folder_configs:
+            json_files = list((config.folder_path / "annotations").glob("*.json"))
             if json_files:
-                self.load_categories_from_file(json_files[0])
+                try:
+                    with open(json_files[0]) as f:
+                        data = json.load(f)
+                    categories = {cat['name'] for cat in data['categories']}
+                    all_categories.update(categories)
+                except Exception as e:
+                    self.log_message(f"Error loading categories from {config.folder_path.name}: {str(e)}")
         
-        # Check if the path is a CVAT folder itself
-        if (path / "annotations").exists() and (path / "images").exists():
-            process_cvat_folder(path)
-        else:
-            # Look for CVAT folders in immediate subdirectories only
-            for item in path.iterdir():
-                if (
-                    item.is_dir() and 
-                    (item / "annotations").exists() and 
-                    (item / "images").exists()
-                ):
-                    process_cvat_folder(item)
+        if all_categories:
+            sorted_categories = sorted(all_categories)
+            self.mapping_table.setRowCount(len(sorted_categories))
+            for i, category in enumerate(sorted_categories):
+                self.mapping_table.setItem(i, 0, QTableWidgetItem(category))
+                self.mapping_table.setItem(i, 1, QTableWidgetItem(str(i)))
+            
+            self.log_message(f"Loaded {len(sorted_categories)} unique categories from {len(self.folder_configs)} folders")
+
+    def configure_frame_ranges(self):
+        """Open the frame range configuration dialog"""
+        dialog = FrameRangeDialog(self.folder_configs, self)
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            try:
+                self.folder_configs = dialog.get_configurations()
+                self.update_folder_list()
+                self.log_message("Frame range configuration updated")
+            except ValueError as e:
+                QMessageBox.warning(self, "Invalid Configuration", str(e))
 
     def update_convert_button_state(self):
+        """Update the convert button state based on inputs"""
         have_input_path = bool(self.input_path.text().strip())
         have_dataset_base = bool(self.dataset_base.text().strip())
-        can_convert = have_input_path and have_dataset_base
+        have_folders = len(self.folder_configs) > 0
+        can_convert = have_input_path and have_dataset_base and have_folders
         self.convert_button.setEnabled(can_convert)
 
-    def load_categories_from_file(self, json_path):
-        """Load categories from a specific JSON file and merge with existing ones"""
-        try:
-            with open(json_path) as f:
-                data = json.load(f)
-            
-            # Get existing categories
-            existing_categories = set()
-            for row in range(self.mapping_table.rowCount()):
-                category_item = self.mapping_table.item(row, 0)
-                if category_item:
-                    existing_categories.add(category_item.text())
-            
-            # Add new categories
-            new_categories = set(cat['name'] for cat in data['categories']) - existing_categories
-            if new_categories:
-                current_row_count = self.mapping_table.rowCount()
-                self.mapping_table.setRowCount(current_row_count + len(new_categories))
-                
-                for i, category in enumerate(new_categories, start=current_row_count):
-                    self.mapping_table.setItem(i, 0, QTableWidgetItem(category))
-                    self.mapping_table.setItem(i, 1, QTableWidgetItem(str(i)))
-                
-                self.log_message(f"Added {len(new_categories)} new categories from {json_path.name}")
-            
-        except Exception as e:
-            self.log_message(f"Failed to load categories from {json_path.name}: {str(e)}")
-
     def browse_folder(self, line_edit):
+        """Browse for a folder"""
         folder = QFileDialog.getExistingDirectory(self, "Select Directory")
         if folder:
             line_edit.setText(folder)
 
     def log_message(self, message):
+        """Add a message to the log"""
         self.log_output.append(message)
 
     def show_error(self, message):
+        """Show an error message"""
         QMessageBox.critical(self, "Error", message)
         self.convert_button.setEnabled(True)
 
     def conversion_finished(self):
+        """Handle conversion completion"""
         self.log_message("Conversion completed successfully!")
         self.convert_button.setEnabled(True)
 
     def start_conversion(self):
+        """Start the conversion process"""
         try:
             # Validate inputs
             if not self.input_path.text() or not self.dataset_base.text():
                 raise ValueError("Input path and dataset base must be specified")
-
+            
+            if not self.folder_configs:
+                raise ValueError("No COCO folders found")
+            
+            # Check label mappings
             label_mapping = self.mapping_table.get_mapping()
             if not label_mapping:
                 raise ValueError("Label mapping cannot be empty")
-
+            
+            # Create config
             config = DatasetConfig(
                 input_path=self.input_path.text(),
                 dataset_base=self.dataset_base.text(),
@@ -891,11 +1166,10 @@ class MainWindow(QMainWindow):
                 test_split_ratio=self.test_split.value(),
                 label_mapping=label_mapping,
                 random_seed=self.random_seed.value(),
-                create_yaml=self.create_yaml_toggle.isChecked()
+                create_yaml=self.create_yaml_toggle.isChecked(),
+                folder_configs=self.folder_configs.copy()
             )
-
-            self.log_message(f"Create YAML file: {'Yes' if self.create_yaml_toggle.isChecked() else 'No'}")
-
+            
             self.convert_button.setEnabled(False)
             self.log_output.clear()
             self.log_message("Starting conversion...")
@@ -906,14 +1180,9 @@ class MainWindow(QMainWindow):
             self.worker.error.connect(self.show_error)
             self.worker.finished.connect(self.conversion_finished)
             self.worker.start()
-
+            
         except Exception as e:
             self.show_error(str(e))
-
-    def browse_folder(self, line_edit):
-        folder = QFileDialog.getExistingDirectory(self, "Select Directory")
-        if folder:
-            line_edit.setText(folder)
 
 def main():
     app = QApplication(sys.argv)
